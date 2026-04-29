@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo, useRef } from "react";
 import {
   Package, Users, FlaskConical, FileText, Settings as SettingsIcon,
   Plus, Trash2, Pencil, Search, Printer, Truck, X, Check,
-  ChevronRight, AlertCircle, Loader2, Copy, ClipboardCheck,
+  ChevronRight, AlertCircle, Loader2, Copy, ClipboardCheck, DollarSign,
 } from "lucide-react";
 
 /* =========================================================================
@@ -104,6 +104,7 @@ const DEFAULT_FEDEX = {
   appAuthToken: "",
   defaultService: "FEDEX_GROUND",
   defaultPackaging: "YOUR_PACKAGING",
+  markupPercent: 0,
   shipFrom: { /* falls back to company info if blank */
     contactName: "",
     companyName: "",
@@ -258,6 +259,17 @@ export default function App() {
 
   return (
     <div className="min-h-screen flex bg-stone-50 text-stone-900" style={{ fontFamily: "'Inter Tight', ui-sans-serif, system-ui, sans-serif" }}>
+      <style>{`
+        input[type="number"]::-webkit-inner-spin-button,
+        input[type="number"]::-webkit-outer-spin-button {
+          -webkit-appearance: none;
+          margin: 0;
+        }
+        input[type="number"] {
+          -moz-appearance: textfield;
+          appearance: textfield;
+        }
+      `}</style>
       <Nav view={view} setView={setView} />
       <main className="flex-1 min-w-0">
         <div className="max-w-[1400px] mx-auto px-8 py-8">
@@ -384,6 +396,9 @@ function NewOrder({ customers, products, counters, company, fedex, onSave, onPri
   const [signatureRequired, setSignatureRequired] = useState(false);
   const [shipping_state, setShippingState] = useState({ status: "idle", tracking: null, labelBase64: null, error: null });
   const [savedOrderId, setSavedOrderId] = useState(null);
+  const [rates, setRates] = useState([]);
+  const [ratesStatus, setRatesStatus] = useState("idle"); // idle | loading | ok | err
+  const [ratesError, setRatesError] = useState(null);
 
   useEffect(() => {
     setInvoiceNumber(formatInvoice(counters.invoice, company));
@@ -500,6 +515,70 @@ function NewOrder({ customers, products, counters, company, fedex, onSave, onPri
       setSavedOrderId(order.id);
     }
     onPrint(order, mode);
+  };
+
+  const markupRate = (amount) => {
+    const pct = Number(fedex.markupPercent) || 0;
+    return Number(amount) * (1 + pct / 100);
+  };
+
+  const useRate = (rate) => {
+    setShipService(rate.serviceType);
+    setShipping(markupRate(rate.amount).toFixed(2));
+    showToast(`Set ${rate.serviceName || rate.serviceType} — ${fmtUSD(markupRate(rate.amount))}`);
+  };
+
+  const getRates = async () => {
+    if (!customer) return showToast("Pick a customer first", "err");
+    if (!fedex.workerUrl) return showToast("Set the FedEx Worker URL in Settings first", "err");
+    if (!shipWeightLbs || Number(shipWeightLbs) <= 0) return showToast("Enter a weight", "err");
+
+    setRatesStatus("loading");
+    setRatesError(null);
+
+    const shipFrom = buildShipFrom(fedex, company);
+    const payload = {
+      from: shipFrom,
+      to: {
+        address: {
+          streetLines: [customer.addressLine1, customer.addressLine2].filter(Boolean),
+          city: customer.city,
+          stateOrProvinceCode: customer.state,
+          postalCode: customer.zip,
+          countryCode: customer.country || "US",
+          residential: !!customer.residential,
+        },
+      },
+      weightLbs: Number(shipWeightLbs),
+      dimensionsIn: shipDims,
+    };
+
+    try {
+      const res = await fetch(fedex.workerUrl + "/rate", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-app-auth": fedex.appAuthToken || "",
+        },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || "Rate request failed");
+
+      // Normalize: total field may be a number or { amount, currency }
+      const normalized = (data.rates || []).map((r) => {
+        const amount = typeof r.total === "object" && r.total !== null ? r.total.amount : r.total;
+        return { ...r, amount: Number(amount) || 0 };
+      }).filter((r) => r.amount > 0);
+
+      normalized.sort((a, b) => a.amount - b.amount);
+      setRates(normalized);
+      setRatesStatus(normalized.length > 0 ? "ok" : "err");
+      if (normalized.length === 0) setRatesError("No rates returned for this destination");
+    } catch (e) {
+      setRatesStatus("err");
+      setRatesError(e.message);
+    }
   };
 
   const handleShip = async () => {
@@ -727,6 +806,83 @@ function NewOrder({ customers, products, counters, company, fedex, onSave, onPri
               Required
             </label>
           </Field>
+        </div>
+
+        <div className="mt-5 pt-4 border-t border-stone-200">
+          <div className="flex items-center justify-between mb-3">
+            <div>
+              <div className="text-sm font-medium">Live FedEx rates</div>
+              <div className="text-xs text-stone-500 mt-0.5">
+                Quote based on the customer's address, weight, and dimensions above
+                {Number(fedex.markupPercent) > 0 && ` · ${fedex.markupPercent}% markup applied`}
+              </div>
+            </div>
+            <button
+              onClick={getRates}
+              disabled={ratesStatus === "loading"}
+              className="px-3 py-1.5 rounded bg-white border border-stone-300 hover:bg-stone-100 text-sm font-medium flex items-center gap-2 disabled:opacity-50"
+            >
+              {ratesStatus === "loading" ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <DollarSign className="w-3.5 h-3.5" />}
+              Get rates
+            </button>
+          </div>
+
+          {ratesStatus === "err" && (
+            <div className="p-3 bg-red-50 border border-red-200 rounded text-sm text-red-700 flex items-start gap-2">
+              <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+              <span>{ratesError}</span>
+            </div>
+          )}
+
+          {ratesStatus === "ok" && rates.length > 0 && (
+            <div className="border border-stone-200 rounded-lg overflow-hidden">
+              <table className="w-full text-sm">
+                <thead className="bg-stone-50 text-xs text-stone-500 uppercase tracking-wider">
+                  <tr>
+                    <th className="text-left py-2 px-3 font-medium">Service</th>
+                    <th className="text-left py-2 px-3 font-medium">Transit</th>
+                    <th className="text-right py-2 px-3 font-medium">FedEx cost</th>
+                    {Number(fedex.markupPercent) > 0 && (
+                      <th className="text-right py-2 px-3 font-medium">Your price</th>
+                    )}
+                    <th className="py-2 px-3"></th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-stone-100">
+                  {rates.map((r) => {
+                    const yourPrice = markupRate(r.amount);
+                    const isSelected =
+                      shipService === r.serviceType &&
+                      Math.abs(Number(shipping) - yourPrice) < 0.01;
+                    return (
+                      <tr key={r.serviceType} className={isSelected ? "bg-emerald-50" : ""}>
+                        <td className="py-2 px-3 font-medium">{r.serviceName || r.serviceType}</td>
+                        <td className="py-2 px-3 text-stone-600">{r.transitTime || "—"}</td>
+                        <td className="py-2 px-3 text-right tabular-nums">{fmtUSD(r.amount)}</td>
+                        {Number(fedex.markupPercent) > 0 && (
+                          <td className="py-2 px-3 text-right tabular-nums font-medium">
+                            {fmtUSD(yourPrice)}
+                          </td>
+                        )}
+                        <td className="py-2 px-3 text-right">
+                          <button
+                            onClick={() => useRate(r)}
+                            className={`text-xs px-2.5 py-1 rounded font-medium ${
+                              isSelected
+                                ? "bg-emerald-600 text-white"
+                                : "bg-stone-900 text-white hover:bg-stone-800"
+                            }`}
+                          >
+                            {isSelected ? "Used" : "Use"}
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
       </Card>
 
@@ -1457,6 +1613,17 @@ function SettingsView({ company, fedex, counters, onSaveCompany, onSaveFedex, on
               <option value="FEDEX_ENVELOPE">FedEx Envelope</option>
             </select>
           </Field>
+          <Field label="S&H markup (%)">
+            <input
+              type="number"
+              step="0.1"
+              value={f.markupPercent ?? 0}
+              onChange={(e) => setFField({ markupPercent: e.target.value })}
+              className={inputCls}
+              placeholder="0"
+            />
+          </Field>
+          <div />
         </div>
 
         <h3 className="font-medium mt-5 mb-2 text-sm">Ship-from address <span className="text-xs text-stone-500 font-normal">(leave blank to use Company info above)</span></h3>
