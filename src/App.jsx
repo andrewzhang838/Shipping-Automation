@@ -2,12 +2,38 @@ import React, { useState, useEffect, useMemo, useRef } from "react";
 import {
   Package, Users, FlaskConical, FileText, Settings as SettingsIcon,
   Plus, Trash2, Pencil, Search, Printer, Truck, X, Check,
-  ChevronRight, AlertCircle, Loader2, Copy, ClipboardCheck, DollarSign,
+  ChevronRight, AlertCircle, Loader2, Copy, ClipboardCheck, DollarSign, Download,
 } from "lucide-react";
 
 /* =========================================================================
-   Storage helpers — backed by window.storage (persistent across sessions)
+   Storage helpers — two modes, auto-detected at startup
+   ----------------------------------------------------------------------
+   1. "backend"  → Cloudflare Worker + KV (shared across devices/team)
+   2. "local"    → localStorage (browser-only fallback before backend
+                                 is configured)
    ========================================================================= */
+
+const BACKEND_CFG_KEY = "shipping_data_backend_v1";
+
+function readBackendCfg() {
+  try {
+    const raw = (typeof localStorage !== "undefined") ? localStorage.getItem(BACKEND_CFG_KEY) : null;
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+
+function writeBackendCfg(cfg) {
+  try {
+    if (cfg && cfg.url) {
+      localStorage.setItem(BACKEND_CFG_KEY, JSON.stringify(cfg));
+    } else {
+      localStorage.removeItem(BACKEND_CFG_KEY);
+    }
+  } catch {}
+}
+
+const _backendCfg = readBackendCfg();
+const STORE_MODE = _backendCfg?.url ? "backend" : "local";
 
 const KEYS = {
   company: "settings:company",
@@ -18,47 +44,85 @@ const KEYS = {
   order: (id) => `orders:${id}`,
 };
 
+async function _api(path, body) {
+  const res = await fetch(_backendCfg.url.replace(/\/+$/, "") + path, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-app-auth": _backendCfg.token || "",
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    let msg = `${path} → HTTP ${res.status}`;
+    try { const j = await res.json(); if (j?.error) msg = j.error; } catch {}
+    throw new Error(msg);
+  }
+  return res.json();
+}
+
 const store = {
+  mode: STORE_MODE,
+
   async get(key, fallback = null) {
     try {
-      const raw = localStorage.getItem(key);
-      return raw ? JSON.parse(raw) : fallback;
-    } catch {
+      if (STORE_MODE === "backend") {
+        const r = await _api("/get", { key });
+        return r ? JSON.parse(r.value) : fallback;
+      }
+      const v = localStorage.getItem(key);
+      return v ? JSON.parse(v) : fallback;
+    } catch (e) {
+      console.error("store.get", key, e);
       return fallback;
     }
   },
 
   async set(key, value) {
     try {
-      localStorage.setItem(key, JSON.stringify(value));
+      const serialized = JSON.stringify(value);
+      if (STORE_MODE === "backend") {
+        await _api("/set", { key, value: serialized });
+      } else {
+        localStorage.setItem(key, serialized);
+      }
       return true;
     } catch (e) {
-      console.error("localStorage.set", key, e);
+      console.error("store.set", key, e);
       return false;
     }
   },
 
   async del(key) {
     try {
-      localStorage.removeItem(key);
+      if (STORE_MODE === "backend") await _api("/delete", { key });
+      else localStorage.removeItem(key);
       return true;
-    } catch {
+    } catch (e) {
+      console.error("store.del", key, e);
       return false;
     }
   },
 
   async list(prefix) {
     try {
+      if (STORE_MODE === "backend") {
+        const r = await _api("/list", { prefix, withValues: true });
+        return (r.items || []).map((i) => {
+          try { return JSON.parse(i.value); } catch { return null; }
+        }).filter(Boolean);
+      }
       const items = [];
       for (let i = 0; i < localStorage.length; i++) {
-        const key = localStorage.key(i);
-        if (key?.startsWith(prefix)) {
-          const raw = localStorage.getItem(key);
-          if (raw) items.push(JSON.parse(raw));
+        const k = localStorage.key(i);
+        if (k && k.startsWith(prefix)) {
+          const v = await this.get(k);
+          if (v) items.push(v);
         }
       }
       return items;
-    } catch {
+    } catch (e) {
+      console.error("store.list", prefix, e);
       return [];
     }
   },
@@ -76,6 +140,156 @@ const niceDate = (s) => {
   const d = new Date(s + (s.length === 10 ? "T00:00:00" : ""));
   return d.toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" });
 };
+
+/* ---------- CSV export utilities ---------- */
+
+function csvEscape(v) {
+  if (v === null || v === undefined) return "";
+  const s = String(v);
+  if (s.includes(",") || s.includes("\n") || s.includes("\r") || s.includes('"')) {
+    return `"${s.replace(/"/g, '""')}"`;
+  }
+  return s;
+}
+
+function rowsToCSV(headers, rows) {
+  const lines = [headers.map(csvEscape).join(",")];
+  for (const row of rows) {
+    lines.push(row.map(csvEscape).join(","));
+  }
+  // Excel-compatible: BOM + CRLF line endings
+  return "\uFEFF" + lines.join("\r\n");
+}
+
+function downloadCSV(filename, csv) {
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
+function todayStamp() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+/* ---------- Per-entity CSV exports ---------- */
+
+function exportCustomersCSV(customers) {
+  const headers = [
+    "Customer ID", "Company Name", "Contact Name",
+    "Address Line 1", "Address Line 2", "City", "State", "ZIP", "Country",
+    "Phone", "Email", "Residential", "Notes",
+  ];
+  const rows = customers.map((c) => [
+    c.customerId || "",
+    c.name || "",
+    c.contactName || "",
+    c.addressLine1 || "",
+    c.addressLine2 || "",
+    c.city || "",
+    c.state || "",
+    c.zip || "",
+    c.country || "",
+    c.phone || "",
+    c.email || "",
+    c.residential ? "Yes" : "No",
+    c.notes || "",
+  ]);
+  downloadCSV(`customers-${todayStamp()}.csv`, rowsToCSV(headers, rows));
+}
+
+function exportProductsCSV(products) {
+  const headers = [
+    "Name", "CAS Number", "Default Unit", "Default Price (USD)",
+    "Default Pack Size", "Current Batch #", "Default Description", "Notes",
+  ];
+  const rows = products.map((p) => [
+    p.name || "",
+    p.casNumber || "",
+    p.defaultUnit || "",
+    p.defaultPrice || "",
+    p.defaultPackSize || "",
+    p.batchNumber || "",
+    p.defaultDescription || "",
+    p.notes || "",
+  ]);
+  downloadCSV(`catalog-${todayStamp()}.csv`, rowsToCSV(headers, rows));
+}
+
+function exportOrdersSummaryCSV(orders) {
+  const headers = [
+    "Invoice #", "Date", "Customer", "Customer ID", "PO #",
+    "Items Subtotal", "S&H", "Total", "Tracking #", "Service",
+    "Ship City", "Ship State", "Ship ZIP",
+  ];
+  const rows = orders.map((o) => {
+    const c = o.customerSnapshot || {};
+    return [
+      o.invoiceNumber || "",
+      o.date || "",
+      c.name || "",
+      c.customerId || "",
+      o.poNumber || "",
+      Number(o.itemsSubtotal || 0).toFixed(2),
+      Number(o.shipping || 0).toFixed(2),
+      Number(o.total || 0).toFixed(2),
+      o.tracking || "",
+      o.shipService || "",
+      c.city || "",
+      c.state || "",
+      c.zip || "",
+    ];
+  });
+  downloadCSV(`orders-${todayStamp()}.csv`, rowsToCSV(headers, rows));
+}
+
+function exportOrdersLineItemsCSV(orders) {
+  const headers = [
+    "Invoice #", "Date", "Customer", "Customer ID",
+    "Product Description", "CAS", "Unit", "Quantity", "Unit Price",
+    "Pack Size", "Pack Count", "Batch #", "Line Amount",
+    "Order S&H", "Order Total", "Tracking #",
+  ];
+  const rows = [];
+  for (const o of orders) {
+    const c = o.customerSnapshot || {};
+    if (!o.lineItems || o.lineItems.length === 0) {
+      rows.push([
+        o.invoiceNumber || "", o.date || "", c.name || "", c.customerId || "",
+        "(no line items)", "", "", "", "", "", "", "", "",
+        Number(o.shipping || 0).toFixed(2), Number(o.total || 0).toFixed(2), o.tracking || "",
+      ]);
+      continue;
+    }
+    for (const li of o.lineItems) {
+      rows.push([
+        o.invoiceNumber || "",
+        o.date || "",
+        c.name || "",
+        c.customerId || "",
+        li.description || "",
+        li.casNumber || "",
+        li.unit || "",
+        li.quantity || "",
+        li.unitPriceNum || "",
+        li.packSize || "",
+        li.packCount || "",
+        li.batchNumber || "",
+        Number(li.amount || 0).toFixed(2),
+        Number(o.shipping || 0).toFixed(2),
+        Number(o.total || 0).toFixed(2),
+        o.tracking || "",
+      ]);
+    }
+  }
+  downloadCSV(`order-line-items-${todayStamp()}.csv`, rowsToCSV(headers, rows));
+}
 
 const DEFAULT_COMPANY = {
   name: "RefDrug",
@@ -159,6 +373,30 @@ export default function App() {
       setOrders(ord.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)));
       setLoading(false);
     })();
+  }, []);
+
+  /* ---------- prevent mouse wheel + arrow keys from changing focused number inputs ---------- */
+  useEffect(() => {
+    const onWheel = () => {
+      const a = document.activeElement;
+      if (a && a.tagName === "INPUT" && a.type === "number") {
+        a.blur();
+      }
+    };
+    const onKey = (e) => {
+      const a = document.activeElement;
+      if (a && a.tagName === "INPUT" && a.type === "number") {
+        if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+          e.preventDefault();
+        }
+      }
+    };
+    window.addEventListener("wheel", onWheel);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("wheel", onWheel);
+      window.removeEventListener("keydown", onKey);
+    };
   }, []);
 
   /* ---------- CRUD wrappers ---------- */
@@ -1144,12 +1382,21 @@ function CustomersView({ customers, onSave, onDelete }) {
           <h1 className="text-2xl font-semibold tracking-tight">Customers</h1>
           <p className="text-sm text-stone-500 mt-0.5">{customers.length} record{customers.length === 1 ? "" : "s"}</p>
         </div>
-        <button
-          onClick={() => setEditing({})}
-          className="px-3 py-2 bg-stone-900 text-white text-sm rounded hover:bg-stone-800 flex items-center gap-1.5"
-        >
-          <Plus className="w-4 h-4" /> New customer
-        </button>
+        <div className="flex gap-2">
+          <button
+            onClick={() => exportCustomersCSV(customers)}
+            disabled={customers.length === 0}
+            className="px-3 py-2 border border-stone-300 text-sm rounded hover:bg-stone-50 flex items-center gap-1.5 disabled:opacity-40"
+          >
+            <Download className="w-4 h-4" /> Export CSV
+          </button>
+          <button
+            onClick={() => setEditing({})}
+            className="px-3 py-2 bg-stone-900 text-white text-sm rounded hover:bg-stone-800 flex items-center gap-1.5"
+          >
+            <Plus className="w-4 h-4" /> New customer
+          </button>
+        </div>
       </header>
 
       <Card>
@@ -1302,12 +1549,21 @@ function ProductsView({ products, onSave, onDelete }) {
           <h1 className="text-2xl font-semibold tracking-tight">Catalog</h1>
           <p className="text-sm text-stone-500 mt-0.5">{products.length} APIs</p>
         </div>
-        <button
-          onClick={() => setEditing({})}
-          className="px-3 py-2 bg-stone-900 text-white text-sm rounded hover:bg-stone-800 flex items-center gap-1.5"
-        >
-          <Plus className="w-4 h-4" /> New product
-        </button>
+        <div className="flex gap-2">
+          <button
+            onClick={() => exportProductsCSV(products)}
+            disabled={products.length === 0}
+            className="px-3 py-2 border border-stone-300 text-sm rounded hover:bg-stone-50 flex items-center gap-1.5 disabled:opacity-40"
+          >
+            <Download className="w-4 h-4" /> Export CSV
+          </button>
+          <button
+            onClick={() => setEditing({})}
+            className="px-3 py-2 bg-stone-900 text-white text-sm rounded hover:bg-stone-800 flex items-center gap-1.5"
+          >
+            <Plus className="w-4 h-4" /> New product
+          </button>
+        </div>
       </header>
 
       <Card>
@@ -1440,9 +1696,28 @@ function HistoryView({ orders, onPrint, onDelete }) {
 
   return (
     <div className="space-y-6">
-      <header>
-        <h1 className="text-2xl font-semibold tracking-tight">Orders</h1>
-        <p className="text-sm text-stone-500 mt-0.5">{orders.length} order{orders.length === 1 ? "" : "s"}</p>
+      <header className="flex items-end justify-between">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">Orders</h1>
+          <p className="text-sm text-stone-500 mt-0.5">{orders.length} order{orders.length === 1 ? "" : "s"}</p>
+        </div>
+        <div className="flex gap-2">
+          <button
+            onClick={() => exportOrdersSummaryCSV(orders)}
+            disabled={orders.length === 0}
+            className="px-3 py-2 border border-stone-300 text-sm rounded hover:bg-stone-50 flex items-center gap-1.5 disabled:opacity-40"
+          >
+            <Download className="w-4 h-4" /> Orders CSV
+          </button>
+          <button
+            onClick={() => exportOrdersLineItemsCSV(orders)}
+            disabled={orders.length === 0}
+            className="px-3 py-2 border border-stone-300 text-sm rounded hover:bg-stone-50 flex items-center gap-1.5 disabled:opacity-40"
+            title="One row per line item — useful for accounting/inventory"
+          >
+            <Download className="w-4 h-4" /> Line items CSV
+          </button>
+        </div>
       </header>
 
       <Card>
@@ -1512,6 +1787,77 @@ function HistoryView({ orders, onPrint, onDelete }) {
    Settings
    ========================================================================= */
 
+function DataSyncCard() {
+  const cur = readBackendCfg() || { url: "", token: "" };
+  const [url, setUrl] = useState(cur.url);
+  const [token, setToken] = useState(cur.token);
+
+  const save = () => {
+    writeBackendCfg({ url: url.trim(), token: token.trim() });
+    location.reload();
+  };
+  const disable = () => {
+    if (!confirm("Stop syncing? Data will fall back to local browser storage. Existing backend data is not deleted.")) return;
+    writeBackendCfg(null);
+    location.reload();
+  };
+
+  const modeLabel = {
+    backend: { text: "Synced to backend", desc: "Customers, products, and orders sync across all devices and team members.", color: "bg-emerald-50 border-emerald-200 text-emerald-900" },
+    local: { text: "Stored in this browser only", desc: "Data is local to this browser and won't appear on other devices. Configure a backend below to enable sync.", color: "bg-amber-50 border-amber-200 text-amber-900" },
+  }[store.mode];
+
+  return (
+    <Card>
+      <h2 className="font-semibold mb-1">Data sync</h2>
+      <div className={`mt-3 mb-4 p-3 border rounded text-sm ${modeLabel.color}`}>
+        <div className="font-medium">{modeLabel.text}</div>
+        <div className="text-xs mt-1 opacity-90">{modeLabel.desc}</div>
+      </div>
+
+      <div className="grid grid-cols-1 gap-3">
+        <Field label="Data Worker URL">
+          <input
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            placeholder="https://shipping-data.your-subdomain.workers.dev"
+            className={inputCls}
+          />
+        </Field>
+        <Field label="App auth token">
+          <input
+            value={token}
+            onChange={(e) => setToken(e.target.value)}
+            placeholder="The APP_AUTH_TOKEN you set on the data Worker"
+            className={inputCls + " font-mono"}
+            type="password"
+          />
+        </Field>
+      </div>
+
+      <div className="flex justify-between items-center mt-4 pt-4 border-t border-stone-200">
+        <div className="text-xs text-stone-500">
+          Saving will reload the page to apply the new mode.
+        </div>
+        <div className="flex gap-2">
+          {store.mode === "backend" && (
+            <button onClick={disable} className="px-3 py-1.5 text-sm rounded border border-stone-300 hover:bg-stone-50">
+              Disable sync
+            </button>
+          )}
+          <button
+            onClick={save}
+            disabled={!url.trim()}
+            className="px-4 py-2 bg-stone-900 text-white rounded text-sm hover:bg-stone-800 disabled:opacity-50"
+          >
+            Save and reload
+          </button>
+        </div>
+      </div>
+    </Card>
+  );
+}
+
 function SettingsView({ company, fedex, counters, onSaveCompany, onSaveFedex, onSaveCounters }) {
   const [c, setC] = useState(company);
   const [f, setF] = useState(fedex);
@@ -1530,6 +1876,8 @@ function SettingsView({ company, fedex, counters, onSaveCompany, onSaveFedex, on
       <header>
         <h1 className="text-2xl font-semibold tracking-tight">Settings</h1>
       </header>
+
+      <DataSyncCard />
 
       <Card>
         <h2 className="font-semibold mb-4">Company info <span className="text-xs text-stone-500 font-normal">— shows on invoices and packing slips</span></h2>
@@ -1672,6 +2020,15 @@ function SettingsView({ company, fedex, counters, onSaveCompany, onSaveFedex, on
 
 function PrintView({ order, mode, company, onClose, switchMode }) {
   const printRef = useRef(null);
+
+  // Set browser tab title (used by print headers if user has them enabled)
+  useEffect(() => {
+    const prev = document.title;
+    const label = mode === "invoice" ? "Invoice" : "Packing Slip";
+    document.title = `${label} ${order.invoiceNumber}`;
+    return () => { document.title = prev; };
+  }, [order.invoiceNumber, mode]);
+
   const doPrint = () => {
     window.print();
   };
@@ -1736,13 +2093,13 @@ function InvoiceDoc({ order, company }) {
   return (
     <div className="p-12 text-[11pt]" style={{ fontFamily: "'Inter Tight', ui-sans-serif, system-ui, sans-serif" }}>
       <div className="flex items-start justify-between gap-4 mb-6">
-        <div className="w-[200px] flex-shrink-0">
+        <div className="w-[180px] flex-shrink-0">
           {company.logoDataUrl && (
-            <img src={company.logoDataUrl} alt={company.name} className="h-14 max-w-[200px] object-contain object-left" />
+            <img src={company.logoDataUrl} alt={company.name} className="h-14 max-w-[180px] object-contain object-left" />
           )}
         </div>
-        <div className="text-2xl font-semibold tracking-wide pt-2">PRO FORMA INVOICE</div>
-        <div className="w-[200px] flex-shrink-0" />
+        <div className="text-2xl font-semibold tracking-wide pt-2 whitespace-nowrap">PRO FORMA INVOICE</div>
+        <div className="w-[180px] flex-shrink-0" />
       </div>
 
       <div className="grid grid-cols-2 gap-8 text-[10pt] mb-6">
@@ -1840,7 +2197,7 @@ function InvoiceDoc({ order, company }) {
 function PartyBlock({ label, customer }) {
   return (
     <div>
-      <div className="font-semibold mb-1">{label}:</div>
+      <div className="font-bold text-[12pt] mb-1.5">{label}:</div>
       <div>{customer.name}</div>
       {customer.addressLine1 && <div>{customer.addressLine1}</div>}
       {customer.addressLine2 && <div>{customer.addressLine2}</div>}
