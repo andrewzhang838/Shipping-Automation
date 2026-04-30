@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo, useRef } from "react";
 import {
   Package, Users, FlaskConical, FileText, Settings as SettingsIcon,
   Plus, Trash2, Pencil, Search, Printer, Truck, X, Check,
-  ChevronRight, AlertCircle, Loader2, Copy, ClipboardCheck, DollarSign, Download, MapPin,
+  ChevronRight, AlertCircle, Loader2, Copy, ClipboardCheck, DollarSign, Download, MapPin, Briefcase,
 } from "lucide-react";
 
 /* =========================================================================
@@ -352,6 +352,7 @@ const DEFAULT_COMPANY = {
   logoDataUrl: "",
   signatureDataUrl: "",
   sealDataUrl: "",
+  salesReps: [], // [{ id, name, email, notes }]
 };
 
 const DEFAULT_FEDEX = {
@@ -379,6 +380,7 @@ const DEFAULT_FEDEX = {
 
 export default function App() {
   const [view, setView] = useState("orders");
+  const [editingOrderId, setEditingOrderId] = useState(null); // when set, NewOrder loads this order for editing
   const [loading, setLoading] = useState(true);
   const [company, setCompany] = useState(DEFAULT_COMPANY);
   const [fedex, setFedex] = useState(DEFAULT_FEDEX);
@@ -504,10 +506,36 @@ export default function App() {
     }
     return rec;
   };
-  const deleteOrder = async (id) => {
-    await store.del(KEYS.order(id));
-    setOrders((prev) => prev.filter((x) => x.id !== id));
+  const deleteOrder = async (id, reason) => {
+    const order = orders.find((o) => o.id === id);
+    if (!order) throw new Error("Order not found");
+
+    // Soft-delete: keep the record but mark it deleted with a reason.
+    // The Orders tab filters these out by default; they can be exported via CSV
+    // or recovered from KV directly if needed for audit/dispute purposes.
+    const updated = {
+      ...order,
+      deletedAt: Date.now(),
+      deletedReason: reason || "",
+    };
+    await store.set(KEYS.order(id), updated);
+    setOrders((prev) => prev.map((o) => (o.id === id ? updated : o)));
     showToast("Order deleted");
+    return updated;
+  };
+
+  const assignSalesRep = async (orderId, repId) => {
+    const order = orders.find((o) => o.id === orderId);
+    if (!order) return;
+    const rep = (company.salesReps || []).find((r) => r.id === repId);
+    const updated = {
+      ...order,
+      salesRepId: repId || null,
+      salesRepSnapshot: rep ? { id: rep.id, name: rep.name, email: rep.email || "" } : null,
+      updatedAt: Date.now(),
+    };
+    await store.set(KEYS.order(orderId), updated);
+    setOrders((prev) => prev.map((o) => (o.id === orderId ? updated : o)));
   };
 
   /* ---------- print preview gateway ---------- */
@@ -549,7 +577,11 @@ export default function App() {
           appearance: textfield;
         }
       `}</style>
-      <Nav view={view} setView={setView} />
+      <Nav view={view} setView={(next) => {
+        // Switching tabs implicitly cancels any in-progress edit
+        if (next !== view && editingOrderId) setEditingOrderId(null);
+        setView(next);
+      }} />
       <main className="flex-1 min-w-0">
         <div className="max-w-[1400px] mx-auto px-8 py-8">
           {view === "orders" && (
@@ -559,9 +591,12 @@ export default function App() {
               counters={counters}
               company={company}
               fedex={fedex}
+              orders={orders}
               onSave={saveOrder}
               onPrint={openPrint}
               showToast={showToast}
+              editingOrderId={editingOrderId}
+              onClearEditing={() => setEditingOrderId(null)}
             />
           )}
           {view === "customers" && (
@@ -584,7 +619,16 @@ export default function App() {
               orders={orders}
               onPrint={openPrint}
               onDelete={deleteOrder}
+              onEdit={(order) => {
+                setEditingOrderId(order.id);
+                setView("orders");
+              }}
+              salesReps={company.salesReps || []}
+              onAssignRep={assignSalesRep}
             />
+          )}
+          {view === "commissions" && (
+            <CommissionsView orders={orders} salesReps={company.salesReps || []} />
           )}
           {view === "settings" && (
             <SettingsView
@@ -622,6 +666,7 @@ function Nav({ view, setView }) {
     { id: "customers", label: "Customers", icon: Users },
     { id: "products", label: "Catalog", icon: FlaskConical },
     { id: "history", label: "Orders", icon: FileText },
+    { id: "commissions", label: "Commissions", icon: Briefcase },
     { id: "settings", label: "Settings", icon: SettingsIcon },
   ];
   return (
@@ -663,7 +708,7 @@ function Nav({ view, setView }) {
    New Order
    ========================================================================= */
 
-function NewOrder({ customers, products, counters, company, fedex, onSave, onPrint, showToast }) {
+function NewOrder({ customers, products, counters, company, fedex, orders, onSave, onPrint, showToast, editingOrderId, onClearEditing }) {
   const [customerId, setCustomerId] = useState("");
   const [poNumber, setPoNumber] = useState("");
   const [date, setDate] = useState(today());
@@ -681,8 +726,36 @@ function NewOrder({ customers, products, counters, company, fedex, onSave, onPri
   const [ratesError, setRatesError] = useState(null);
 
   useEffect(() => {
-    setInvoiceNumber(formatInvoice(counters.invoice, company));
-  }, [counters.invoice, company.name]);
+    // When new (no saved order), keep invoice # in sync with the counter
+    if (!savedOrderId) setInvoiceNumber(formatInvoice(counters.invoice, company));
+  }, [counters.invoice, company.name, savedOrderId]);
+
+  // Load an existing order into the form when editingOrderId changes
+  useEffect(() => {
+    if (!editingOrderId) return;
+    const o = orders.find((x) => x.id === editingOrderId);
+    if (!o) return;
+    setSavedOrderId(o.id);
+    setInvoiceNumber(o.invoiceNumber || "");
+    setPoNumber(o.poNumber || "");
+    setDate(o.date || today());
+    setCustomerId(o.customerId || (o.customerSnapshot?.id) || "");
+    setLineItems((o.lineItems || []).map((li) => ({ ...li, id: li.id || newId() })));
+    setShipping(o.shipping || 0);
+    setShipWeightLbs(o.shipWeightLbs || 2);
+    setShipDims(o.shipDims || { length: 10, width: 8, height: 4 });
+    setShipService(o.shipService || fedex.defaultService || "FEDEX_GROUND");
+    setSignatureRequired(!!o.signatureRequired);
+    setShippingState({
+      status: o.tracking ? "ok" : "idle",
+      tracking: o.tracking || null,
+      labelBase64: o.labelBase64 || null,
+      error: null,
+    });
+    setRates([]);
+    setRatesStatus("idle");
+    setRatesError(null);
+  }, [editingOrderId, orders]);
 
   const customer = customers.find((c) => c.id === customerId);
   const itemsSubtotal = useMemo(
@@ -750,22 +823,32 @@ function NewOrder({ customers, products, counters, company, fedex, onSave, onPri
 
   const removeLine = (id) => setLineItems((prev) => prev.filter((it) => it.id !== id));
 
-  const buildOrder = () => ({
-    invoiceNumber,
-    poNumber,
-    date,
-    customerId: customer?.id,
-    customerSnapshot: customer ? { ...customer } : null,
-    lineItems,
-    shipping: Number(shipping) || 0,
-    itemsSubtotal,
-    total,
-    shipWeightLbs: Number(shipWeightLbs) || 0,
-    shipDims,
-    shipService,
-    signatureRequired,
-    tracking: shipping_state.tracking || null,
-  });
+  const buildOrder = () => {
+    const existing = savedOrderId ? orders.find((o) => o.id === savedOrderId) : null;
+    return {
+      invoiceNumber,
+      poNumber,
+      date,
+      customerId: customer?.id,
+      customerSnapshot: customer ? { ...customer } : null,
+      lineItems,
+      shipping: Number(shipping) || 0,
+      itemsSubtotal,
+      total,
+      shipWeightLbs: Number(shipWeightLbs) || 0,
+      shipDims,
+      shipService,
+      signatureRequired,
+      // Sales rep — set via Orders tab, never via this form. Preserve any prior value.
+      salesRepId: existing?.salesRepId || null,
+      salesRepSnapshot: existing?.salesRepSnapshot || null,
+      // Persisted shipping fields — carry forward from the existing record
+      tracking: shipping_state.tracking || existing?.tracking || null,
+      labelBase64: existing?.labelBase64 || null,
+      labelFormat: existing?.labelFormat || null,
+      shippedAt: existing?.shippedAt || null,
+    };
+  };
 
   const validate = () => {
     if (!customer) return "Pick a customer";
@@ -914,11 +997,13 @@ function NewOrder({ customers, products, counters, company, fedex, onSave, onPri
         error: null,
       });
 
-      // save with tracking
+      // save with tracking + label PDF
       const order = await onSave({
         ...buildOrder(),
         id: savedOrderId || undefined,
         tracking: data.trackingNumber,
+        labelBase64: data.labelBase64 || null,
+        labelFormat: data.labelFormat || "application/pdf",
         shippedAt: Date.now(),
       });
       setSavedOrderId(order.id);
@@ -941,20 +1026,30 @@ function NewOrder({ customers, products, counters, company, fedex, onSave, onPri
     setShippingState({ status: "idle", tracking: null, labelBase64: null, error: null });
     setSavedOrderId(null);
     setInvoiceNumber(formatInvoice(counters.invoice, company));
+    if (editingOrderId) onClearEditing?.();
   };
+
+  const isEditing = !!editingOrderId;
+  const isShipped = !!shipping_state.tracking;
 
   return (
     <div className="space-y-6">
       <header className="flex items-end justify-between">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">New Order</h1>
-          <p className="text-sm text-stone-500 mt-0.5">Create an invoice, packing slip, and FedEx label.</p>
+          <h1 className="text-2xl font-semibold tracking-tight">
+            {isEditing ? (isShipped ? "Edit Order" : "Edit Draft") : "New Order"}
+          </h1>
+          <p className="text-sm text-stone-500 mt-0.5">
+            {isEditing
+              ? `Editing ${invoiceNumber}. Changes save back to the same order.`
+              : "Create an invoice, packing slip, and FedEx label."}
+          </p>
         </div>
         <button
           onClick={reset}
           className="text-sm text-stone-600 hover:text-stone-900 px-3 py-1.5 rounded border border-stone-200 hover:bg-white"
         >
-          Clear form
+          {isEditing ? "Done editing" : "Clear form"}
         </button>
       </header>
 
@@ -1404,6 +1499,7 @@ function LineItemRow({ index, line, products, onChange, onPick, onRemove }) {
 function CustomersView({ customers, onSave, onDelete, fedex }) {
   const [editing, setEditing] = useState(null);
   const [search, setSearch] = useState("");
+  const [deleteTarget, setDeleteTarget] = useState(null);
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -1472,7 +1568,7 @@ function CustomersView({ customers, onSave, onDelete, fedex }) {
                 </div>
                 <div className="flex items-center gap-1 shrink-0">
                   <IconButton onClick={() => setEditing(c)} icon={Pencil} title="Edit" />
-                  <IconButton onClick={() => { if (confirm(`Delete ${c.name}?`)) onDelete(c.id); }} icon={Trash2} title="Delete" danger />
+                  <IconButton onClick={() => setDeleteTarget(c)} icon={Trash2} title="Delete" danger />
                 </div>
               </div>
             ))}
@@ -1489,6 +1585,28 @@ function CustomersView({ customers, onSave, onDelete, fedex }) {
             fedex={fedex}
           />
         </Modal>
+      )}
+
+      {deleteTarget && (
+        <ConfirmDeleteModal
+          entityType="Customer"
+          entityName={deleteTarget.name}
+          details={
+            <>
+              <div><span className="text-stone-500">Name:</span> <span className="font-medium">{deleteTarget.name}</span></div>
+              {deleteTarget.customerId && <div><span className="text-stone-500">ID:</span> <span className="font-mono">{deleteTarget.customerId}</span></div>}
+              {deleteTarget.contactName && <div><span className="text-stone-500">Contact:</span> {deleteTarget.contactName}</div>}
+              {(deleteTarget.city || deleteTarget.state) && (
+                <div><span className="text-stone-500">Location:</span> {[deleteTarget.city, deleteTarget.state].filter(Boolean).join(", ")}</div>
+              )}
+            </>
+          }
+          onClose={() => setDeleteTarget(null)}
+          onConfirm={async () => {
+            await onDelete(deleteTarget.id);
+            setDeleteTarget(null);
+          }}
+        />
       )}
     </div>
   );
@@ -1710,6 +1828,7 @@ function CustomerForm({ initial, onSave, onCancel, fedex }) {
 function ProductsView({ products, onSave, onDelete }) {
   const [editing, setEditing] = useState(null);
   const [search, setSearch] = useState("");
+  const [deleteTarget, setDeleteTarget] = useState(null);
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -1781,7 +1900,7 @@ function ProductsView({ products, onSave, onDelete }) {
                     <td className="py-2.5 pr-4 font-mono text-xs text-stone-500">{p.batchNumber}</td>
                     <td className="py-2.5 text-right whitespace-nowrap">
                       <IconButton onClick={() => setEditing(p)} icon={Pencil} title="Edit" />
-                      <IconButton onClick={() => { if (confirm(`Delete ${p.name}?`)) onDelete(p.id); }} icon={Trash2} title="Delete" danger />
+                      <IconButton onClick={() => setDeleteTarget(p)} icon={Trash2} title="Delete" danger />
                     </td>
                   </tr>
                 ))}
@@ -1799,6 +1918,26 @@ function ProductsView({ products, onSave, onDelete }) {
             onSave={async (rec) => { await onSave(rec); setEditing(null); }}
           />
         </Modal>
+      )}
+
+      {deleteTarget && (
+        <ConfirmDeleteModal
+          entityType="Product"
+          entityName={deleteTarget.name}
+          details={
+            <>
+              <div><span className="text-stone-500">Name:</span> <span className="font-medium">{deleteTarget.name}</span></div>
+              {deleteTarget.casNumber && <div><span className="text-stone-500">CAS:</span> <span className="font-mono">{deleteTarget.casNumber}</span></div>}
+              {deleteTarget.defaultPackSize && <div><span className="text-stone-500">Pack size:</span> {deleteTarget.defaultPackSize}</div>}
+              {deleteTarget.batchNumber && <div><span className="text-stone-500">Current batch:</span> <span className="font-mono">{deleteTarget.batchNumber}</span></div>}
+            </>
+          }
+          onClose={() => setDeleteTarget(null)}
+          onConfirm={async () => {
+            await onDelete(deleteTarget.id);
+            setDeleteTarget(null);
+          }}
+        />
       )}
     </div>
   );
@@ -1858,27 +1997,46 @@ function ProductForm({ initial, onSave, onCancel }) {
    History
    ========================================================================= */
 
-function HistoryView({ orders, onPrint, onDelete }) {
+function HistoryView({ orders, onPrint, onDelete, onEdit, salesReps, onAssignRep }) {
   const [search, setSearch] = useState("");
+  const [deleteTarget, setDeleteTarget] = useState(null); // order being deleted
+  const [showDeleted, setShowDeleted] = useState(false);
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
-    if (!q) return orders;
-    return orders.filter(
+    let base = showDeleted ? orders : orders.filter((o) => !o.deletedAt);
+    if (!q) return base;
+    return base.filter(
       (o) =>
         o.invoiceNumber?.toLowerCase().includes(q) ||
         o.customerSnapshot?.name?.toLowerCase().includes(q) ||
         o.tracking?.toLowerCase().includes(q)
     );
-  }, [orders, search]);
+  }, [orders, search, showDeleted]);
+
+  const deletedCount = orders.filter((o) => o.deletedAt).length;
 
   return (
     <div className="space-y-6">
       <header className="flex items-end justify-between">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Orders</h1>
-          <p className="text-sm text-stone-500 mt-0.5">{orders.length} order{orders.length === 1 ? "" : "s"}</p>
+          <p className="text-sm text-stone-500 mt-0.5">
+            {orders.length - deletedCount} active
+            {deletedCount > 0 && ` · ${deletedCount} deleted`}
+          </p>
         </div>
-        <div className="flex gap-2">
+        <div className="flex gap-2 items-center">
+          {deletedCount > 0 && (
+            <label className="flex items-center gap-1.5 text-sm text-stone-600 px-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={showDeleted}
+                onChange={(e) => setShowDeleted(e.target.checked)}
+              />
+              Show deleted
+            </label>
+          )}
           <button
             onClick={() => exportOrdersSummaryCSV(orders)}
             disabled={orders.length === 0}
@@ -1920,13 +2078,18 @@ function HistoryView({ orders, onPrint, onDelete }) {
                   <th className="py-2 pr-4 font-medium">Customer</th>
                   <th className="py-2 pr-4 font-medium text-right">Total</th>
                   <th className="py-2 pr-4 font-medium">Tracking</th>
+                  <th className="py-2 pr-4 font-medium">Sales rep</th>
                   <th className="py-2"></th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-stone-100">
                 {filtered.map((o) => (
-                  <tr key={o.id}>
-                    <td className="py-2.5 pr-4 font-medium">{o.invoiceNumber}</td>
+                  <tr key={o.id} className={o.deletedAt ? "bg-stone-50 opacity-60" : ""}>
+                    <td className="py-2.5 pr-4 font-medium">
+                      {o.deletedAt && <span className="text-[10px] uppercase tracking-wider text-red-700 bg-red-50 px-1.5 py-0.5 rounded mr-2">Deleted</span>}
+                      {!o.deletedAt && !o.tracking && <span className="text-[10px] uppercase tracking-wider text-amber-700 bg-amber-50 px-1.5 py-0.5 rounded mr-2">Draft</span>}
+                      <span className={o.deletedAt ? "line-through" : ""}>{o.invoiceNumber}</span>
+                    </td>
                     <td className="py-2.5 pr-4 text-stone-600">{niceDate(o.date)}</td>
                     <td className="py-2.5 pr-4">{o.customerSnapshot?.name}</td>
                     <td className="py-2.5 pr-4 text-right tabular-nums">{fmtUSD(o.total)}</td>
@@ -1944,10 +2107,38 @@ function HistoryView({ orders, onPrint, onDelete }) {
                         <span className="text-stone-400">—</span>
                       )}
                     </td>
+                    <td className="py-2.5 pr-4">
+                      {!o.deletedAt ? (
+                        <select
+                          value={o.salesRepId || ""}
+                          onChange={(e) => onAssignRep(o.id, e.target.value)}
+                          className="h-8 px-2 border border-stone-200 rounded text-xs bg-white max-w-[140px] focus:outline-none focus:ring-2 focus:ring-stone-900/10 focus:border-stone-400"
+                        >
+                          <option value="">— None —</option>
+                          {salesReps.map((r) => (
+                            <option key={r.id} value={r.id}>{r.name}</option>
+                          ))}
+                        </select>
+                      ) : (
+                        <span className="text-xs text-stone-400">{o.salesRepSnapshot?.name || "—"}</span>
+                      )}
+                    </td>
                     <td className="py-2.5 text-right whitespace-nowrap">
+                      {!o.deletedAt && (
+                        <IconButton onClick={() => onEdit(o)} icon={Pencil} title={o.tracking ? "Edit order" : "Edit draft"} />
+                      )}
                       <IconButton onClick={() => onPrint(o, "invoice")} icon={FileText} title="Invoice" />
                       <IconButton onClick={() => onPrint(o, "packing")} icon={Package} title="Packing slip" />
-                      <IconButton onClick={() => { if (confirm(`Delete order ${o.invoiceNumber}?`)) onDelete(o.id); }} icon={Trash2} title="Delete" danger />
+                      {o.labelBase64 && (
+                        <IconButton
+                          onClick={() => openPdfFromBase64(o.labelBase64, `Label-${o.tracking || o.invoiceNumber}.pdf`)}
+                          icon={Truck}
+                          title="FedEx label"
+                        />
+                      )}
+                      {!o.deletedAt && (
+                        <IconButton onClick={() => setDeleteTarget(o)} icon={Trash2} title="Delete" danger />
+                      )}
                     </td>
                   </tr>
                 ))}
@@ -1956,7 +2147,251 @@ function HistoryView({ orders, onPrint, onDelete }) {
           </div>
         )}
       </Card>
+
+      {deleteTarget && (
+        <DeleteOrderModal
+          order={deleteTarget}
+          onClose={() => setDeleteTarget(null)}
+          onConfirm={async (reason) => {
+            await onDelete(deleteTarget.id, reason);
+            setDeleteTarget(null);
+          }}
+        />
+      )}
     </div>
+  );
+}
+
+
+/* ---------- Reusable confirm-delete modal: type-to-confirm pattern ---------- */
+
+function ConfirmDeleteModal({ entityType, entityName, details, onClose, onConfirm }) {
+  const [typed, setTyped] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState(null);
+
+  const expected = (entityName || "").trim();
+  const matches = typed.trim() === expected;
+
+  const submit = async () => {
+    if (!matches) {
+      setError(`Type the ${entityType.toLowerCase()} name exactly to confirm.`);
+      return;
+    }
+    setSubmitting(true);
+    setError(null);
+    try {
+      await onConfirm();
+    } catch (e) {
+      setError(e.message || "Deletion failed");
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <Modal onClose={submitting ? () => {} : onClose} title={`Delete ${entityType.toLowerCase()}`}>
+      <div className="space-y-4">
+        <div className="p-4 bg-amber-50 border border-amber-200 rounded text-sm text-amber-900">
+          <div className="flex items-start gap-2">
+            <AlertCircle className="w-5 h-5 mt-0.5 shrink-0" />
+            <div>
+              <div className="font-semibold mb-1">This permanently deletes the {entityType.toLowerCase()}.</div>
+              <div>Past orders that referenced this {entityType.toLowerCase()} keep their snapshot, so order history is preserved. The {entityType.toLowerCase()} itself cannot be recovered.</div>
+            </div>
+          </div>
+        </div>
+
+        {details && (
+          <div className="border border-stone-200 rounded p-3 text-sm space-y-1">
+            <div className="text-xs uppercase tracking-wider text-stone-500 font-medium mb-1.5">{entityType} being deleted</div>
+            {details}
+          </div>
+        )}
+
+        <Field label={
+          <>Type <code className="font-mono bg-stone-100 px-1 py-0.5 rounded text-stone-900">{expected}</code> to confirm</>
+        }>
+          <input
+            value={typed}
+            onChange={(e) => setTyped(e.target.value)}
+            className={inputCls + " font-mono"}
+            placeholder={expected}
+            autoFocus
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && matches && !submitting) submit();
+            }}
+          />
+        </Field>
+
+        {error && (
+          <div className="p-3 bg-red-50 border border-red-200 rounded text-sm text-red-700 flex items-start gap-2">
+            <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+            <span>{error}</span>
+          </div>
+        )}
+
+        <div className="flex justify-end gap-2 pt-3 border-t border-stone-200">
+          <button
+            onClick={onClose}
+            disabled={submitting}
+            className="px-3 py-1.5 text-sm rounded border border-stone-300 hover:bg-stone-50 disabled:opacity-50"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={submit}
+            disabled={submitting || !matches}
+            className="px-4 py-2 bg-red-600 text-white text-sm rounded hover:bg-red-700 disabled:opacity-50 flex items-center gap-2"
+          >
+            {submitting && <Loader2 className="w-4 h-4 animate-spin" />}
+            Delete {entityType.toLowerCase()}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function DeleteOrderModal({ order, onClose, onConfirm }) {
+  const [step, setStep] = useState(1);
+  const [reason, setReason] = useState("");
+  const [acknowledgeChecked, setAcknowledgeChecked] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState(null);
+
+  const c = order.customerSnapshot || {};
+  const hasActiveLabel = !!order.tracking;
+
+  const submit = async () => {
+    if (!reason.trim()) {
+      setError("Please enter a reason — this protects you from accidental deletions.");
+      return;
+    }
+    setSubmitting(true);
+    setError(null);
+    try {
+      await onConfirm(reason.trim());
+    } catch (e) {
+      setError(e.message || "Deletion failed");
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <Modal onClose={submitting ? () => {} : onClose} title="Delete order">
+      {step === 1 && (
+        <div className="space-y-4">
+          <div className="p-4 bg-amber-50 border border-amber-200 rounded">
+            <div className="flex items-start gap-2">
+              <AlertCircle className="w-5 h-5 text-amber-700 mt-0.5 shrink-0" />
+              <div className="text-sm text-amber-900">
+                <div className="font-semibold mb-1">Make sure this is the right order to delete.</div>
+                <div>The order will be marked deleted and hidden from the default Orders view, but the record stays in your data for audit. Toggle <span className="font-medium">Show deleted</span> to see it again.</div>
+              </div>
+            </div>
+          </div>
+
+          {hasActiveLabel && (
+            <div className="p-3 bg-red-50 border border-red-200 rounded text-sm text-red-800">
+              <div className="font-semibold mb-1 flex items-center gap-1.5">
+                <AlertCircle className="w-4 h-4" />
+                This order has an active FedEx label
+              </div>
+              <div>
+                Tracking <span className="font-mono">{order.tracking}</span> is still live with FedEx and may bill when scanned.
+                If the package isn't going out, <span className="font-medium">cancel the label first</span> using the red ❌ button — then delete the order.
+              </div>
+            </div>
+          )}
+
+          <div className="border border-stone-200 rounded p-3 text-sm space-y-1">
+            <div className="text-xs uppercase tracking-wider text-stone-500 font-medium mb-1.5">Order being deleted</div>
+            <div><span className="text-stone-500">Invoice:</span> <span className="font-medium">{order.invoiceNumber}</span></div>
+            <div><span className="text-stone-500">Customer:</span> <span className="font-medium">{c.name}</span></div>
+            <div><span className="text-stone-500">Date:</span> {niceDate(order.date)}</div>
+            <div><span className="text-stone-500">Total:</span> {fmtUSD(order.total)}</div>
+            {order.tracking && <div><span className="text-stone-500">Tracking:</span> <span className="font-mono">{order.tracking}</span></div>}
+          </div>
+
+          <label className="flex items-start gap-2 text-sm cursor-pointer p-2 hover:bg-stone-50 rounded">
+            <input
+              type="checkbox"
+              checked={acknowledgeChecked}
+              onChange={(e) => setAcknowledgeChecked(e.target.checked)}
+              className="mt-1"
+            />
+            <span className="text-stone-700">
+              I want to delete this order. I've reviewed the details above and confirm this is the right one.
+            </span>
+          </label>
+
+          <div className="flex justify-end gap-2 pt-3 border-t border-stone-200">
+            <button onClick={onClose} className="px-3 py-1.5 text-sm rounded border border-stone-300 hover:bg-stone-50">
+              Keep order
+            </button>
+            <button
+              onClick={() => setStep(2)}
+              disabled={!acknowledgeChecked}
+              className="px-4 py-2 bg-red-600 text-white text-sm rounded hover:bg-red-700 disabled:opacity-50"
+            >
+              Continue to delete
+            </button>
+          </div>
+        </div>
+      )}
+
+      {step === 2 && (
+        <div className="space-y-4">
+          <div className="text-sm text-stone-700">
+            Last step. Briefly note why you're deleting this order — it gets saved on the record so you can look back later.
+          </div>
+
+          <Field label="Reason for deleting *">
+            <textarea
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+              className="w-full min-h-[80px] px-3 py-2 border border-stone-200 rounded text-sm bg-white focus:outline-none focus:ring-2 focus:ring-stone-900/10 focus:border-stone-400"
+              placeholder="e.g. Duplicate order, customer cancelled, test order"
+              autoFocus
+            />
+          </Field>
+
+          {error && (
+            <div className="p-3 bg-red-50 border border-red-200 rounded text-sm text-red-700 flex items-start gap-2">
+              <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+              <span>{error}</span>
+            </div>
+          )}
+
+          <div className="flex justify-between items-center pt-3 border-t border-stone-200">
+            <button
+              onClick={() => setStep(1)}
+              disabled={submitting}
+              className="text-sm text-stone-600 hover:text-stone-900 disabled:opacity-50"
+            >
+              ← Back
+            </button>
+            <div className="flex gap-2">
+              <button
+                onClick={onClose}
+                disabled={submitting}
+                className="px-3 py-1.5 text-sm rounded border border-stone-300 hover:bg-stone-50 disabled:opacity-50"
+              >
+                Keep order
+              </button>
+              <button
+                onClick={submit}
+                disabled={submitting || !reason.trim()}
+                className="px-4 py-2 bg-red-600 text-white text-sm rounded hover:bg-red-700 disabled:opacity-50 flex items-center gap-2"
+              >
+                {submitting && <Loader2 className="w-4 h-4 animate-spin" />}
+                Delete order
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </Modal>
   );
 }
 
@@ -2035,6 +2470,402 @@ function DataSyncCard() {
   );
 }
 
+/* =========================================================================
+   Sales reps management (Settings card)
+   ========================================================================= */
+
+function SalesRepsCard({ reps, onChange }) {
+  const [editing, setEditing] = useState(null); // { id?, name, email, notes }
+  const [deleteTarget, setDeleteTarget] = useState(null);
+
+  const submit = (rep) => {
+    if (!rep.name?.trim()) return;
+    let next;
+    if (rep.id) {
+      next = reps.map((r) => (r.id === rep.id ? { ...r, ...rep } : r));
+    } else {
+      next = [...reps, { ...rep, id: newId() }];
+    }
+    onChange(next);
+    setEditing(null);
+  };
+
+  const remove = (id) => {
+    onChange(reps.filter((r) => r.id !== id));
+    setDeleteTarget(null);
+  };
+
+  return (
+    <Card>
+      <div className="flex items-center justify-between mb-3">
+        <div>
+          <h2 className="font-semibold">Sales reps <span className="text-xs text-stone-500 font-normal">— internal only, never shown on invoices or packing slips</span></h2>
+          <p className="text-xs text-stone-500 mt-0.5">Used for tagging orders and tracking commission.</p>
+        </div>
+        <button
+          onClick={() => setEditing({ name: "", email: "", notes: "" })}
+          className="px-3 py-2 bg-stone-900 text-white text-sm rounded hover:bg-stone-800 flex items-center gap-1.5"
+        >
+          <Plus className="w-4 h-4" /> Add rep
+        </button>
+      </div>
+
+      {reps.length === 0 ? (
+        <Empty msg="No reps yet. Add one to start tagging orders for commission tracking." />
+      ) : (
+        <div className="divide-y divide-stone-100 border border-stone-200 rounded">
+          {reps.map((r) => (
+            <div key={r.id} className="px-3 py-2 flex items-center gap-3">
+              <div className="flex-1 min-w-0">
+                <div className="font-medium">{r.name}</div>
+                {(r.email || r.notes) && (
+                  <div className="text-xs text-stone-500 mt-0.5">
+                    {[r.email, r.notes].filter(Boolean).join(" · ")}
+                  </div>
+                )}
+              </div>
+              <IconButton onClick={() => setEditing(r)} icon={Pencil} title="Edit" />
+              <IconButton onClick={() => setDeleteTarget(r)} icon={Trash2} title="Remove" danger />
+            </div>
+          ))}
+        </div>
+      )}
+
+      {editing && (
+        <Modal onClose={() => setEditing(null)} title={editing.id ? "Edit rep" : "Add rep"}>
+          <SalesRepForm initial={editing} onCancel={() => setEditing(null)} onSave={submit} />
+        </Modal>
+      )}
+
+      {deleteTarget && (
+        <ConfirmDeleteModal
+          entityType="Rep"
+          entityName={deleteTarget.name}
+          details={
+            <>
+              <div><span className="text-stone-500">Name:</span> <span className="font-medium">{deleteTarget.name}</span></div>
+              {deleteTarget.email && <div><span className="text-stone-500">Email:</span> {deleteTarget.email}</div>}
+              <div className="text-xs text-stone-500 pt-1">Past orders attributed to this rep will keep the rep's name on record (snapshot).</div>
+            </>
+          }
+          onClose={() => setDeleteTarget(null)}
+          onConfirm={async () => remove(deleteTarget.id)}
+        />
+      )}
+    </Card>
+  );
+}
+
+function SalesRepForm({ initial, onSave, onCancel }) {
+  const [r, setR] = useState({ name: "", email: "", notes: "", ...initial });
+  const set = (patch) => setR({ ...r, ...patch });
+  return (
+    <div className="space-y-3">
+      <Field label="Name *">
+        <input value={r.name} onChange={(e) => set({ name: e.target.value })} className={inputCls} autoFocus />
+      </Field>
+      <Field label="Email">
+        <input value={r.email} onChange={(e) => set({ email: e.target.value })} className={inputCls} />
+      </Field>
+      <Field label="Notes">
+        <input value={r.notes} onChange={(e) => set({ notes: e.target.value })} className={inputCls} placeholder="e.g. ABCMB LLC contractor; 10% on Reta/Tirz" />
+      </Field>
+      <div className="flex justify-end gap-2 pt-2 border-t border-stone-200">
+        <button onClick={onCancel} className="px-3 py-1.5 text-sm rounded border border-stone-300 hover:bg-stone-50">Cancel</button>
+        <button onClick={() => onSave(r)} className="px-3 py-1.5 text-sm rounded bg-stone-900 text-white hover:bg-stone-800">Save</button>
+      </div>
+    </div>
+  );
+}
+
+/* =========================================================================
+   Commissions view
+   ========================================================================= */
+
+const COMMISSION_PERIODS = [
+  { id: "all", label: "All time" },
+  { id: "this_month", label: "This month" },
+  { id: "last_month", label: "Last month" },
+  { id: "ytd", label: "Year to date" },
+  { id: "last_30", label: "Last 30 days" },
+  { id: "last_90", label: "Last 90 days" },
+];
+
+function periodRange(periodId) {
+  const now = new Date();
+  const startOfDay = (d) => { const x = new Date(d); x.setHours(0, 0, 0, 0); return x; };
+  const startOfMonth = (d) => { const x = new Date(d.getFullYear(), d.getMonth(), 1); return x; };
+  const endOfMonth = (d) => { const x = new Date(d.getFullYear(), d.getMonth() + 1, 0, 23, 59, 59, 999); return x; };
+
+  if (periodId === "all") return { start: null, end: null };
+  if (periodId === "this_month") return { start: startOfMonth(now), end: now };
+  if (periodId === "last_month") {
+    const lastMo = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    return { start: startOfMonth(lastMo), end: endOfMonth(lastMo) };
+  }
+  if (periodId === "ytd") return { start: new Date(now.getFullYear(), 0, 1), end: now };
+  if (periodId === "last_30") return { start: startOfDay(new Date(now.getTime() - 30 * 86400_000)), end: now };
+  if (periodId === "last_90") return { start: startOfDay(new Date(now.getTime() - 90 * 86400_000)), end: now };
+  return { start: null, end: null };
+}
+
+function CommissionsView({ orders, salesReps }) {
+  const [period, setPeriod] = useState("this_month");
+  const [drilldownRepId, setDrilldownRepId] = useState(null);
+
+  // Filter to non-deleted orders only — deleted orders don't count toward commissions
+  const activeOrders = useMemo(() => orders.filter((o) => !o.deletedAt), [orders]);
+
+  // Apply date range to orders. Use order.date (the invoice date) as the basis.
+  const { start, end } = periodRange(period);
+  const inRange = useMemo(() => {
+    if (!start && !end) return activeOrders;
+    return activeOrders.filter((o) => {
+      if (!o.date) return false;
+      const d = new Date(o.date + (o.date.length === 10 ? "T00:00:00" : ""));
+      if (start && d < start) return false;
+      if (end && d > end) return false;
+      return true;
+    });
+  }, [activeOrders, start, end]);
+
+  // Group by salesRepId (use snapshot id; fall back to "unassigned" bucket)
+  const summary = useMemo(() => {
+    const map = new Map(); // repId -> { repId, repName, orderCount, revenue, itemsRevenue, shipping }
+    for (const o of inRange) {
+      const repId = o.salesRepId || "__unassigned";
+      const repName = o.salesRepSnapshot?.name || "(Unassigned)";
+      if (!map.has(repId)) {
+        map.set(repId, { repId, repName, orderCount: 0, revenue: 0, itemsRevenue: 0, shipping: 0 });
+      }
+      const row = map.get(repId);
+      row.orderCount += 1;
+      row.revenue += Number(o.total) || 0;
+      row.itemsRevenue += Number(o.itemsSubtotal) || 0;
+      row.shipping += Number(o.shipping) || 0;
+    }
+    // Make sure every defined rep appears even with zero orders, but only when not "all time"
+    for (const r of salesReps) {
+      if (!map.has(r.id)) {
+        map.set(r.id, { repId: r.id, repName: r.name, orderCount: 0, revenue: 0, itemsRevenue: 0, shipping: 0 });
+      }
+    }
+    return Array.from(map.values()).sort((a, b) => b.revenue - a.revenue);
+  }, [inRange, salesReps]);
+
+  const totals = useMemo(() => {
+    return summary.reduce(
+      (acc, r) => ({
+        orderCount: acc.orderCount + r.orderCount,
+        revenue: acc.revenue + r.revenue,
+        itemsRevenue: acc.itemsRevenue + r.itemsRevenue,
+        shipping: acc.shipping + r.shipping,
+      }),
+      { orderCount: 0, revenue: 0, itemsRevenue: 0, shipping: 0 }
+    );
+  }, [summary]);
+
+  const drilldownOrders = useMemo(() => {
+    if (!drilldownRepId) return [];
+    return inRange
+      .filter((o) => (o.salesRepId || "__unassigned") === drilldownRepId)
+      .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  }, [inRange, drilldownRepId]);
+
+  const drilldownRep = summary.find((r) => r.repId === drilldownRepId);
+
+  const exportSummary = () => {
+    const headers = ["Sales Rep", "Orders", "Items Revenue", "Shipping", "Total Revenue"];
+    const rows = summary.map((r) => [
+      r.repName,
+      r.orderCount,
+      r.itemsRevenue.toFixed(2),
+      r.shipping.toFixed(2),
+      r.revenue.toFixed(2),
+    ]);
+    rows.push(["TOTAL", totals.orderCount, totals.itemsRevenue.toFixed(2), totals.shipping.toFixed(2), totals.revenue.toFixed(2)]);
+    downloadCSV(`commissions-${period}-${todayStamp()}.csv`, rowsToCSV(headers, rows));
+  };
+
+  const exportRepDetail = () => {
+    if (!drilldownRep) return;
+    const headers = ["Invoice #", "Date", "Customer", "Items Subtotal", "Shipping", "Total", "Tracking"];
+    const rows = drilldownOrders.map((o) => [
+      o.invoiceNumber || "",
+      o.date || "",
+      o.customerSnapshot?.name || "",
+      Number(o.itemsSubtotal || 0).toFixed(2),
+      Number(o.shipping || 0).toFixed(2),
+      Number(o.total || 0).toFixed(2),
+      o.tracking || "",
+    ]);
+    const safeName = drilldownRep.repName.replace(/[^a-z0-9]+/gi, "-");
+    downloadCSV(`commissions-${safeName}-${period}-${todayStamp()}.csv`, rowsToCSV(headers, rows));
+  };
+
+  return (
+    <div className="space-y-6">
+      <header className="flex items-end justify-between">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">Commissions</h1>
+          <p className="text-sm text-stone-500 mt-0.5">
+            Orders attributed to each sales rep. Commission rates are calculated externally.
+          </p>
+        </div>
+        <div className="flex gap-2 items-center">
+          <select
+            value={period}
+            onChange={(e) => setPeriod(e.target.value)}
+            className="h-10 px-3 border border-stone-200 rounded text-sm bg-white"
+          >
+            {COMMISSION_PERIODS.map((p) => (
+              <option key={p.id} value={p.id}>{p.label}</option>
+            ))}
+          </select>
+          <button
+            onClick={exportSummary}
+            disabled={summary.length === 0}
+            className="px-3 py-2 border border-stone-300 text-sm rounded hover:bg-stone-50 flex items-center gap-1.5 disabled:opacity-40"
+          >
+            <Download className="w-4 h-4" /> Export summary
+          </button>
+        </div>
+      </header>
+
+      {!drilldownRepId && (
+        <Card>
+          {summary.length === 0 || totals.orderCount === 0 ? (
+            <Empty msg={salesReps.length === 0
+              ? "No sales reps yet. Add one in Settings to start tracking commissions."
+              : "No orders in this period."} />
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead className="text-left text-xs text-stone-500 uppercase tracking-wider border-b border-stone-200">
+                  <tr>
+                    <th className="py-2 pr-4 font-medium">Sales Rep</th>
+                    <th className="py-2 pr-4 font-medium text-right">Orders</th>
+                    <th className="py-2 pr-4 font-medium text-right">Items Revenue</th>
+                    <th className="py-2 pr-4 font-medium text-right">Shipping</th>
+                    <th className="py-2 pr-4 font-medium text-right">Total Revenue</th>
+                    <th className="py-2"></th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-stone-100">
+                  {summary.map((r) => (
+                    <tr key={r.repId} className={r.orderCount === 0 ? "text-stone-400" : ""}>
+                      <td className="py-2.5 pr-4 font-medium">
+                        {r.repName}
+                        {r.repId === "__unassigned" && (
+                          <span className="text-[10px] uppercase tracking-wider text-amber-700 bg-amber-50 px-1.5 py-0.5 rounded ml-2">No rep</span>
+                        )}
+                      </td>
+                      <td className="py-2.5 pr-4 text-right tabular-nums">{r.orderCount}</td>
+                      <td className="py-2.5 pr-4 text-right tabular-nums">{fmtUSD(r.itemsRevenue)}</td>
+                      <td className="py-2.5 pr-4 text-right tabular-nums text-stone-500">{fmtUSD(r.shipping)}</td>
+                      <td className="py-2.5 pr-4 text-right tabular-nums font-semibold">{fmtUSD(r.revenue)}</td>
+                      <td className="py-2.5 text-right">
+                        {r.orderCount > 0 && (
+                          <button
+                            onClick={() => setDrilldownRepId(r.repId)}
+                            className="text-xs text-stone-600 hover:text-stone-900 px-2 py-1 rounded hover:bg-stone-100 inline-flex items-center gap-1"
+                          >
+                            View orders <ChevronRight className="w-3 h-3" />
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+                <tfoot className="border-t-2 border-stone-300">
+                  <tr className="font-semibold">
+                    <td className="py-2.5 pr-4">Total</td>
+                    <td className="py-2.5 pr-4 text-right tabular-nums">{totals.orderCount}</td>
+                    <td className="py-2.5 pr-4 text-right tabular-nums">{fmtUSD(totals.itemsRevenue)}</td>
+                    <td className="py-2.5 pr-4 text-right tabular-nums text-stone-500">{fmtUSD(totals.shipping)}</td>
+                    <td className="py-2.5 pr-4 text-right tabular-nums">{fmtUSD(totals.revenue)}</td>
+                    <td></td>
+                  </tr>
+                </tfoot>
+              </table>
+            </div>
+          )}
+        </Card>
+      )}
+
+      {drilldownRepId && drilldownRep && (
+        <Card>
+          <div className="flex items-center justify-between mb-3">
+            <div>
+              <button
+                onClick={() => setDrilldownRepId(null)}
+                className="text-sm text-stone-600 hover:text-stone-900 mb-1"
+              >
+                ← Back to all reps
+              </button>
+              <h2 className="font-semibold text-lg">
+                {drilldownRep.repName}
+                {drilldownRep.repId === "__unassigned" && <span className="text-stone-500 font-normal text-sm"> (orders without a rep tagged)</span>}
+              </h2>
+              <p className="text-xs text-stone-500 mt-0.5">
+                {drilldownRep.orderCount} orders · {fmtUSD(drilldownRep.revenue)} total revenue
+              </p>
+            </div>
+            <button
+              onClick={exportRepDetail}
+              className="px-3 py-2 border border-stone-300 text-sm rounded hover:bg-stone-50 flex items-center gap-1.5"
+            >
+              <Download className="w-4 h-4" /> Export detail
+            </button>
+          </div>
+
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead className="text-left text-xs text-stone-500 uppercase tracking-wider border-b border-stone-200">
+                <tr>
+                  <th className="py-2 pr-4 font-medium">Invoice #</th>
+                  <th className="py-2 pr-4 font-medium">Date</th>
+                  <th className="py-2 pr-4 font-medium">Customer</th>
+                  <th className="py-2 pr-4 font-medium text-right">Items</th>
+                  <th className="py-2 pr-4 font-medium text-right">Shipping</th>
+                  <th className="py-2 pr-4 font-medium text-right">Total</th>
+                  <th className="py-2 pr-4 font-medium">Tracking</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-stone-100">
+                {drilldownOrders.map((o) => (
+                  <tr key={o.id}>
+                    <td className="py-2.5 pr-4 font-medium">{o.invoiceNumber}</td>
+                    <td className="py-2.5 pr-4 text-stone-600">{niceDate(o.date)}</td>
+                    <td className="py-2.5 pr-4">{o.customerSnapshot?.name}</td>
+                    <td className="py-2.5 pr-4 text-right tabular-nums">{fmtUSD(o.itemsSubtotal)}</td>
+                    <td className="py-2.5 pr-4 text-right tabular-nums text-stone-500">{fmtUSD(o.shipping)}</td>
+                    <td className="py-2.5 pr-4 text-right tabular-nums font-medium">{fmtUSD(o.total)}</td>
+                    <td className="py-2.5 pr-4 font-mono text-xs">
+                      {o.tracking ? (
+                        <a
+                          href={`https://www.fedex.com/fedextrack/?trknbr=${o.tracking}`}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="text-blue-700 hover:underline"
+                        >
+                          {o.tracking}
+                        </a>
+                      ) : (
+                        <span className="text-stone-400">—</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      )}
+    </div>
+  );
+}
+
 function SettingsView({ company, fedex, counters, onSaveCompany, onSaveFedex, onSaveCounters }) {
   const [c, setC] = useState(company);
   const [f, setF] = useState(fedex);
@@ -2055,6 +2886,15 @@ function SettingsView({ company, fedex, counters, onSaveCompany, onSaveFedex, on
       </header>
 
       <DataSyncCard />
+
+      <SalesRepsCard
+        reps={c.salesReps || []}
+        onChange={(reps) => {
+          const next = { ...c, salesReps: reps };
+          setC(next);
+          onSaveCompany(next);
+        }}
+      />
 
       <Card>
         <h2 className="font-semibold mb-4">Company info <span className="text-xs text-stone-500 font-normal">— shows on invoices and packing slips</span></h2>
