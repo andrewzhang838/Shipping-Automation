@@ -178,6 +178,47 @@ function todayStamp() {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
+/* ---------- Title formatting helpers (used for PDF filename) ---------- */
+
+function formatTitleDate(s) {
+  if (!s) return todayStamp();
+  // Normalize "2026-04-29" → "2026-04-29" (already good for sortable filenames)
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  try {
+    const d = new Date(s);
+    if (!isNaN(d)) {
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    }
+  } catch {}
+  return s;
+}
+
+function formatProductNames(lineItems) {
+  if (!lineItems || lineItems.length === 0) return "";
+  // Pull the first word of each line item description (skip pack size, etc.)
+  const names = lineItems
+    .map((li) => {
+      const desc = (li.description || "").trim();
+      if (!desc) return "";
+      // "GHK-Cu, 1x5g bottle" → "GHK-Cu"
+      // "Dihexa 10g vial" → "Dihexa"
+      const beforeComma = desc.split(",")[0].trim();
+      return beforeComma.split(/\s+/)[0]; // first whitespace-separated token
+    })
+    .filter(Boolean);
+  // Dedupe while preserving order
+  const seen = new Set();
+  const unique = names.filter((n) => {
+    const k = n.toLowerCase();
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+  if (unique.length === 0) return "";
+  if (unique.length <= 3) return unique.join(", ");
+  return `${unique.slice(0, 3).join(", ")} +${unique.length - 3} more`;
+}
+
 /* ---------- Per-entity CSV exports ---------- */
 
 function exportCustomersCSV(customers) {
@@ -2021,13 +2062,23 @@ function SettingsView({ company, fedex, counters, onSaveCompany, onSaveFedex, on
 function PrintView({ order, mode, company, onClose, switchMode }) {
   const printRef = useRef(null);
 
-  // Set browser tab title (used by print headers if user has them enabled)
+  // Set browser tab title — also becomes the default PDF filename when printing
   useEffect(() => {
     const prev = document.title;
-    const label = mode === "invoice" ? "Invoice" : "Packing Slip";
-    document.title = `${label} ${order.invoiceNumber}`;
+    const customer = order.customerSnapshot?.name || "Customer";
+    const datePart = formatTitleDate(order.date);
+    const productPart = formatProductNames(order.lineItems);
+
+    const companyPrefix = (company.name || "").trim();
+    const prefix = mode === "invoice"
+      ? (companyPrefix ? `${companyPrefix} Invoice` : "Invoice")
+      : "Packing Slip";
+
+    document.title = [prefix, "to", customer, datePart, productPart]
+      .filter(Boolean)
+      .join(" ");
     return () => { document.title = prev; };
-  }, [order.invoiceNumber, mode]);
+  }, [order, mode, company.name]);
 
   const doPrint = () => {
     window.print();
@@ -2093,13 +2144,13 @@ function InvoiceDoc({ order, company }) {
   return (
     <div className="p-12 text-[11pt]" style={{ fontFamily: "'Inter Tight', ui-sans-serif, system-ui, sans-serif" }}>
       <div className="flex items-start justify-between gap-4 mb-6">
-        <div className="w-[180px] flex-shrink-0">
+        <div className="w-[260px] flex-shrink-0">
           {company.logoDataUrl && (
-            <img src={company.logoDataUrl} alt={company.name} className="h-14 max-w-[180px] object-contain object-left" />
+            <img src={company.logoDataUrl} alt={company.name} className="h-24 max-w-[260px] object-contain object-left" />
           )}
         </div>
-        <div className="text-2xl font-semibold tracking-wide pt-2 whitespace-nowrap">PRO FORMA INVOICE</div>
-        <div className="w-[180px] flex-shrink-0" />
+        <div className="text-2xl font-semibold tracking-wide pt-6 whitespace-nowrap">PRO FORMA INVOICE</div>
+        <div className="w-[260px] flex-shrink-0" />
       </div>
 
       <div className="grid grid-cols-2 gap-8 text-[10pt] mb-6">
@@ -2218,7 +2269,7 @@ function PackingDoc({ order, company }) {
       <div className="flex items-start justify-between gap-4 mb-4">
         <div>
           {company.logoDataUrl && (
-            <img src={company.logoDataUrl} alt={company.name} className="h-14 max-w-[220px] object-contain object-left" />
+            <img src={company.logoDataUrl} alt={company.name} className="h-24 max-w-[300px] object-contain object-left" />
           )}
         </div>
         <div className="text-right text-[9pt] text-stone-500">RLD/Comparator, CTM</div>
