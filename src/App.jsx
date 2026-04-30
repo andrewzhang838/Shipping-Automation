@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo, useRef } from "react";
 import {
   Package, Users, FlaskConical, FileText, Settings as SettingsIcon,
   Plus, Trash2, Pencil, Search, Printer, Truck, X, Check,
-  ChevronRight, AlertCircle, Loader2, Copy, ClipboardCheck, DollarSign, Download,
+  ChevronRight, AlertCircle, Loader2, Copy, ClipboardCheck, DollarSign, Download, MapPin,
 } from "lucide-react";
 
 /* =========================================================================
@@ -569,6 +569,7 @@ export default function App() {
               customers={customers}
               onSave={upsertCustomer}
               onDelete={deleteCustomer}
+              fedex={fedex}
             />
           )}
           {view === "products" && (
@@ -1400,7 +1401,7 @@ function LineItemRow({ index, line, products, onChange, onPick, onRemove }) {
    Customers
    ========================================================================= */
 
-function CustomersView({ customers, onSave, onDelete }) {
+function CustomersView({ customers, onSave, onDelete, fedex }) {
   const [editing, setEditing] = useState(null);
   const [search, setSearch] = useState("");
 
@@ -1485,6 +1486,7 @@ function CustomersView({ customers, onSave, onDelete }) {
             initial={editing}
             onCancel={() => setEditing(null)}
             onSave={async (rec) => { await onSave(rec); setEditing(null); }}
+            fedex={fedex}
           />
         </Modal>
       )}
@@ -1492,7 +1494,7 @@ function CustomersView({ customers, onSave, onDelete }) {
   );
 }
 
-function CustomerForm({ initial, onSave, onCancel }) {
+function CustomerForm({ initial, onSave, onCancel, fedex }) {
   const [c, setC] = useState({
     customerId: "",
     name: "",
@@ -1509,11 +1511,85 @@ function CustomerForm({ initial, onSave, onCancel }) {
     notes: "",
     ...initial,
   });
-  const set = (patch) => setC({ ...c, ...patch });
+  const [validation, setValidation] = useState({ status: "idle", result: null, error: null });
+
+  const set = (patch) => {
+    setC({ ...c, ...patch });
+    // Any address change invalidates the prior validation result
+    if (
+      "addressLine1" in patch || "addressLine2" in patch ||
+      "city" in patch || "state" in patch || "zip" in patch || "country" in patch
+    ) {
+      if (validation.status !== "idle") setValidation({ status: "idle", result: null, error: null });
+    }
+  };
+
   const submit = () => {
     if (!c.name?.trim()) return;
     onSave(c);
   };
+
+  const validate = async () => {
+    if (!fedex?.workerUrl) {
+      setValidation({ status: "err", result: null, error: "Set the FedEx Worker URL in Settings first." });
+      return;
+    }
+    if (!c.addressLine1?.trim()) {
+      setValidation({ status: "err", result: null, error: "Address Line 1 is required." });
+      return;
+    }
+    setValidation({ status: "loading", result: null, error: null });
+    try {
+      const res = await fetch(fedex.workerUrl.replace(/\/+$/, "") + "/validate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-app-auth": fedex.appAuthToken || "" },
+        body: JSON.stringify({
+          address: {
+            streetLines: [c.addressLine1, c.addressLine2].filter(Boolean),
+            city: c.city,
+            stateOrProvinceCode: c.state,
+            postalCode: c.zip,
+            countryCode: c.country || "US",
+          },
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || "Validation request failed");
+      setValidation({ status: "ok", result: data, error: null });
+    } catch (e) {
+      setValidation({ status: "err", result: null, error: e.message });
+    }
+  };
+
+  const applyStandardized = () => {
+    const s = validation.result?.standardized;
+    if (!s) return;
+    const patch = {
+      addressLine1: s.streetLines[0] || c.addressLine1,
+      addressLine2: s.streetLines[1] || "",
+      city: s.city || c.city,
+      state: s.stateOrProvinceCode || c.state,
+      zip: s.postalCode || c.zip,
+      country: s.countryCode || c.country,
+    };
+    // Also apply residential classification if FedEx is confident
+    if (validation.result?.classification === "RESIDENTIAL") patch.residential = true;
+    if (validation.result?.classification === "BUSINESS") patch.residential = false;
+    setC({ ...c, ...patch });
+    setValidation({ status: "applied", result: validation.result, error: null });
+  };
+
+  const r = validation.result;
+  const standardizedDiffers =
+    r?.standardized &&
+    (
+      (r.standardized.streetLines[0] || "").toUpperCase() !== (c.addressLine1 || "").toUpperCase() ||
+      (r.standardized.streetLines[1] || "").toUpperCase() !== (c.addressLine2 || "").toUpperCase() ||
+      (r.standardized.city || "").toUpperCase() !== (c.city || "").toUpperCase() ||
+      (r.standardized.stateOrProvinceCode || "").toUpperCase() !== (c.state || "").toUpperCase() ||
+      (r.standardized.postalCode || "") !== (c.zip || "")
+    );
+
   return (
     <div className="space-y-3">
       <div className="grid grid-cols-2 gap-3">
@@ -1559,6 +1635,66 @@ function CustomerForm({ initial, onSave, onCancel }) {
           </label>
         </Field>
       </div>
+
+      {/* --- Address validation panel --- */}
+      <div className="pt-3 border-t border-stone-200">
+        <div className="flex items-center justify-between mb-2">
+          <div className="text-xs uppercase tracking-wider text-stone-500 font-medium">Address validation</div>
+          <button
+            onClick={validate}
+            disabled={validation.status === "loading"}
+            className="px-3 py-1.5 text-sm rounded border border-stone-300 hover:bg-stone-50 flex items-center gap-1.5 disabled:opacity-50"
+          >
+            {validation.status === "loading" ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <MapPin className="w-3.5 h-3.5" />}
+            Validate with FedEx
+          </button>
+        </div>
+
+        {validation.status === "err" && (
+          <div className="p-2.5 bg-red-50 border border-red-200 rounded text-sm text-red-700 flex items-start gap-2">
+            <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+            <span>{validation.error}</span>
+          </div>
+        )}
+
+        {(validation.status === "ok" || validation.status === "applied") && r && (
+          <div className={`p-3 border rounded text-sm ${r.ok ? "bg-emerald-50 border-emerald-200" : "bg-amber-50 border-amber-200"}`}>
+            <div className="flex items-center gap-2 font-medium mb-1.5">
+              {r.ok ? <Check className="w-4 h-4 text-emerald-700" /> : <AlertCircle className="w-4 h-4 text-amber-700" />}
+              <span className={r.ok ? "text-emerald-900" : "text-amber-900"}>
+                {r.ok ? "FedEx recognizes this address" : "FedEx couldn't fully verify this address"}
+              </span>
+              <span className="ml-auto text-xs font-normal text-stone-600">
+                Classification: <span className="font-medium">{r.classification}</span>
+              </span>
+            </div>
+
+            {r.standardized && (
+              <div className="text-xs text-stone-700 leading-relaxed mb-2">
+                <div className="font-medium text-stone-800">FedEx-standardized version:</div>
+                <div>{r.standardized.streetLines.join(", ")}</div>
+                <div>
+                  {[r.standardized.city, r.standardized.stateOrProvinceCode, r.standardized.postalCode].filter(Boolean).join(", ")}
+                  {r.standardized.countryCode ? ` ${r.standardized.countryCode}` : ""}
+                </div>
+              </div>
+            )}
+
+            {validation.status === "ok" && standardizedDiffers && (
+              <button
+                onClick={applyStandardized}
+                className="text-xs px-2.5 py-1 rounded bg-stone-900 text-white hover:bg-stone-800"
+              >
+                Apply FedEx-standardized version
+              </button>
+            )}
+            {validation.status === "applied" && (
+              <div className="text-xs text-emerald-700">✓ Standardized version applied to the form above.</div>
+            )}
+          </div>
+        )}
+      </div>
+
       <div className="flex justify-end gap-2 pt-2 border-t border-stone-200">
         <button onClick={onCancel} className="px-3 py-1.5 text-sm rounded border border-stone-300 hover:bg-stone-50">Cancel</button>
         <button onClick={submit} className="px-3 py-1.5 text-sm rounded bg-stone-900 text-white hover:bg-stone-800">Save</button>
