@@ -3,7 +3,12 @@ import {
   Package, Users, FlaskConical, FileText, Settings as SettingsIcon,
   Plus, Trash2, Pencil, Search, Printer, Truck, X, Check,
   ChevronRight, AlertCircle, Loader2, Copy, ClipboardCheck, DollarSign, Download, MapPin, Briefcase,
+  TrendingUp, TrendingDown, Minus,
 } from "lucide-react";
+import {
+  BarChart, Bar, XAxis, YAxis, Tooltip as RTooltip, ResponsiveContainer,
+  PieChart, Pie, Cell, Legend, CartesianGrid,
+} from "recharts";
 
 /* =========================================================================
    Storage helpers — two modes, auto-detected at startup
@@ -630,11 +635,22 @@ export default function App() {
           {view === "commissions" && (
             <CommissionsView orders={orders} salesReps={company.salesReps || []} />
           )}
+          {view === "reports" && (
+            <ReportsView
+              orders={orders}
+              customers={customers}
+              products={products}
+              salesReps={company.salesReps || []}
+            />
+          )}
           {view === "settings" && (
             <SettingsView
               company={company}
               fedex={fedex}
               counters={counters}
+              customers={customers}
+              products={products}
+              orders={orders}
               onSaveCompany={saveCompany}
               onSaveFedex={saveFedex}
               onSaveCounters={saveCounters}
@@ -667,6 +683,7 @@ function Nav({ view, setView }) {
     { id: "products", label: "Catalog", icon: FlaskConical },
     { id: "history", label: "Orders", icon: FileText },
     { id: "commissions", label: "Commissions", icon: Briefcase },
+    { id: "reports", label: "Reports", icon: AlertCircle },
     { id: "settings", label: "Settings", icon: SettingsIcon },
   ];
   return (
@@ -2006,12 +2023,20 @@ function HistoryView({ orders, onPrint, onDelete, onEdit, salesReps, onAssignRep
     const q = search.trim().toLowerCase();
     let base = showDeleted ? orders : orders.filter((o) => !o.deletedAt);
     if (!q) return base;
-    return base.filter(
-      (o) =>
-        o.invoiceNumber?.toLowerCase().includes(q) ||
-        o.customerSnapshot?.name?.toLowerCase().includes(q) ||
-        o.tracking?.toLowerCase().includes(q)
-    );
+    return base.filter((o) => {
+      if (o.invoiceNumber?.toLowerCase().includes(q)) return true;
+      if (o.customerSnapshot?.name?.toLowerCase().includes(q)) return true;
+      if (o.tracking?.toLowerCase().includes(q)) return true;
+      if (o.poNumber?.toLowerCase().includes(q)) return true;
+      if (o.salesRepSnapshot?.name?.toLowerCase().includes(q)) return true;
+      // Line item match: description, CAS number, or batch number
+      if (o.lineItems?.some((li) =>
+        li.description?.toLowerCase().includes(q) ||
+        li.casNumber?.toLowerCase().includes(q) ||
+        li.batchNumber?.toLowerCase().includes(q)
+      )) return true;
+      return false;
+    });
   }, [orders, search, showDeleted]);
 
   const deletedCount = orders.filter((o) => o.deletedAt).length;
@@ -2061,7 +2086,7 @@ function HistoryView({ orders, onPrint, onDelete, onEdit, salesReps, onAssignRep
           <input
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search by invoice #, customer, or tracking…"
+            placeholder="Search by invoice #, customer, tracking, PO #, sales rep, product, CAS, or batch…"
             className={inputCls + " pl-9"}
           />
         </div>
@@ -2471,6 +2496,155 @@ function DataSyncCard() {
 }
 
 /* =========================================================================
+   Backup & Restore
+   ========================================================================= */
+
+function BackupCard({ company, fedex, counters, customers, products, orders }) {
+  const [restoring, setRestoring] = useState(false);
+  const [restoreState, setRestoreState] = useState(null); // null | { error } | { ok, summary }
+
+  const exportBackup = () => {
+    const snapshot = {
+      _meta: {
+        format: "shipping-app-backup-v1",
+        exportedAt: new Date().toISOString(),
+        appVersion: "1",
+        counts: {
+          customers: customers.length,
+          products: products.length,
+          orders: orders.length,
+        },
+      },
+      settings: {
+        company,
+        fedex: { ...fedex, appAuthToken: fedex.appAuthToken ? "***REDACTED***" : "" },
+        counters,
+      },
+      customers,
+      products,
+      orders,
+    };
+    const blob = new Blob([JSON.stringify(snapshot, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `shipping-backup-${todayStamp()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  };
+
+  const handleRestore = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setRestoring(true);
+    setRestoreState(null);
+    const reader = new FileReader();
+    reader.onload = async () => {
+      try {
+        const data = JSON.parse(String(reader.result));
+        if (data?._meta?.format !== "shipping-app-backup-v1") {
+          throw new Error("File is not a recognized backup format.");
+        }
+        const confirmText = `RESTORE BACKUP
+
+This will OVERWRITE all current data with the backup contents:
+- ${(data.customers || []).length} customers
+- ${(data.products || []).length} products
+- ${(data.orders || []).length} orders
+
+Backup was taken: ${data._meta.exportedAt || "unknown"}
+
+This cannot be undone. Continue?`;
+        if (!confirm(confirmText)) {
+          setRestoring(false);
+          return;
+        }
+
+        // Restore: write each record to storage. Existing records with the same ID
+        // are overwritten; records present locally but not in backup are NOT deleted
+        // (the merge model — safer than wholesale wipe-and-replace).
+        let touched = 0;
+        if (data.settings?.company) { await store.set(KEYS.company, data.settings.company); touched++; }
+        if (data.settings?.fedex && data.settings.fedex.appAuthToken !== "***REDACTED***") {
+          await store.set(KEYS.fedex, data.settings.fedex); touched++;
+        }
+        if (data.settings?.counters) { await store.set(KEYS.counters, data.settings.counters); touched++; }
+        for (const c of (data.customers || [])) { await store.set(KEYS.customer(c.id), c); touched++; }
+        for (const p of (data.products || [])) { await store.set(KEYS.product(p.id), p); touched++; }
+        for (const o of (data.orders || [])) { await store.set(KEYS.order(o.id), o); touched++; }
+
+        setRestoreState({ ok: true, summary: `Restored ${touched} records. Reloading…` });
+        setTimeout(() => location.reload(), 1500);
+      } catch (err) {
+        setRestoreState({ error: err.message || "Restore failed" });
+        setRestoring(false);
+      }
+    };
+    reader.onerror = () => {
+      setRestoreState({ error: "Failed to read file" });
+      setRestoring(false);
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+
+  return (
+    <Card>
+      <h2 className="font-semibold mb-1">Backup & restore</h2>
+      <p className="text-xs text-stone-500 mb-4">
+        Cloudflare KV doesn't auto-backup. Export a JSON snapshot of all your data weekly and store it somewhere safe (Google Drive, Dropbox, your laptop). Restore from any snapshot if data is lost or corrupted.
+      </p>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+        <div className="p-3 border border-stone-200 rounded">
+          <div className="text-sm font-medium mb-1">Export snapshot</div>
+          <div className="text-xs text-stone-500 mb-3 leading-relaxed">
+            Downloads a single JSON file containing all customers ({customers.length}), products ({products.length}), orders ({orders.length}), and settings. Safe to email or upload — secrets like the FedEx auth token are redacted.
+          </div>
+          <button
+            onClick={exportBackup}
+            className="px-3 py-2 bg-stone-900 text-white text-sm rounded hover:bg-stone-800 flex items-center gap-1.5 w-fit"
+          >
+            <Download className="w-4 h-4" /> Download backup
+          </button>
+        </div>
+
+        <div className="p-3 border border-stone-200 rounded">
+          <div className="text-sm font-medium mb-1">Restore from backup</div>
+          <div className="text-xs text-stone-500 mb-3 leading-relaxed">
+            Upload a previously exported JSON snapshot. Records with matching IDs are <span className="font-medium">overwritten</span>. Records that exist locally but not in the backup are <span className="font-medium">left alone</span> — restore is additive, not destructive.
+          </div>
+          <label className={`px-3 py-2 border border-stone-300 text-sm rounded inline-flex items-center gap-1.5 cursor-pointer w-fit ${restoring ? "opacity-50 cursor-not-allowed" : "hover:bg-stone-50"}`}>
+            <input type="file" accept=".json,application/json" onChange={handleRestore} disabled={restoring} className="hidden" />
+            {restoring ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
+            Choose backup file
+          </label>
+        </div>
+      </div>
+
+      {restoreState?.error && (
+        <div className="mt-3 p-3 bg-red-50 border border-red-200 rounded text-sm text-red-700 flex items-start gap-2">
+          <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+          <span>{restoreState.error}</span>
+        </div>
+      )}
+      {restoreState?.ok && (
+        <div className="mt-3 p-3 bg-emerald-50 border border-emerald-200 rounded text-sm text-emerald-700 flex items-start gap-2">
+          <Check className="w-4 h-4 mt-0.5 shrink-0" />
+          <span>{restoreState.summary}</span>
+        </div>
+      )}
+
+      <div className="mt-4 pt-4 border-t border-stone-200 text-xs text-stone-500 leading-relaxed">
+        <span className="font-medium text-stone-700">For automated weekly backups:</span> see <code className="bg-stone-100 px-1 py-0.5 rounded">backup-script.js</code> in your project files. Schedule it on your Mac via cron or launchd to auto-export to Google Drive, Dropbox, or any cloud folder.
+      </div>
+    </Card>
+  );
+}
+
+/* =========================================================================
    Sales reps management (Settings card)
    ========================================================================= */
 
@@ -2866,7 +3040,655 @@ function CommissionsView({ orders, salesReps }) {
   );
 }
 
-function SettingsView({ company, fedex, counters, onSaveCompany, onSaveFedex, onSaveCounters }) {
+/* =========================================================================
+   Reports — dashboard with KPIs, trends, top tables, and dormant customers
+   ========================================================================= */
+
+const REPORT_PERIODS = [
+  { id: "this_month", label: "This month" },
+  { id: "last_month", label: "Last month" },
+  { id: "ytd", label: "Year to date" },
+  { id: "last_30", label: "Last 30 days" },
+  { id: "last_90", label: "Last 90 days" },
+  { id: "last_12_months", label: "Last 12 months" },
+  { id: "all", label: "All time" },
+];
+
+const DORMANT_THRESHOLDS = [
+  { id: 30, label: "30+ days" },
+  { id: 60, label: "60+ days" },
+  { id: 90, label: "90+ days" },
+  { id: 180, label: "6+ months" },
+];
+
+// Color palette for charts — stone-grays + a few accents that print/render well
+const CHART_COLORS = ["#1c1917", "#57534e", "#a8a29e", "#0e7490", "#0891b2", "#22c55e", "#eab308", "#dc2626"];
+
+function reportPeriodRange(periodId) {
+  const now = new Date();
+  const startOfMonth = (d) => new Date(d.getFullYear(), d.getMonth(), 1);
+  const endOfMonth = (d) => new Date(d.getFullYear(), d.getMonth() + 1, 0, 23, 59, 59, 999);
+  const startOfDay = (d) => { const x = new Date(d); x.setHours(0, 0, 0, 0); return x; };
+
+  if (periodId === "all") return { start: null, end: null, label: "all time" };
+  if (periodId === "this_month") return { start: startOfMonth(now), end: now, label: "this month" };
+  if (periodId === "last_month") {
+    const last = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    return { start: startOfMonth(last), end: endOfMonth(last), label: "last month" };
+  }
+  if (periodId === "ytd") return { start: new Date(now.getFullYear(), 0, 1), end: now, label: "year to date" };
+  if (periodId === "last_30") return { start: startOfDay(new Date(now.getTime() - 30 * 86400_000)), end: now, label: "last 30 days" };
+  if (periodId === "last_90") return { start: startOfDay(new Date(now.getTime() - 90 * 86400_000)), end: now, label: "last 90 days" };
+  if (periodId === "last_12_months") {
+    const start = new Date(now.getFullYear(), now.getMonth() - 11, 1);
+    return { start, end: now, label: "last 12 months" };
+  }
+  return { start: null, end: null, label: "all time" };
+}
+
+function priorPeriodRange(periodId) {
+  const now = new Date();
+  if (periodId === "this_month") {
+    const last = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    return { start: new Date(last.getFullYear(), last.getMonth(), 1), end: new Date(last.getFullYear(), last.getMonth() + 1, 0, 23, 59, 59, 999) };
+  }
+  if (periodId === "last_month") {
+    const month = new Date(now.getFullYear(), now.getMonth() - 2, 1);
+    return { start: new Date(month.getFullYear(), month.getMonth(), 1), end: new Date(month.getFullYear(), month.getMonth() + 1, 0, 23, 59, 59, 999) };
+  }
+  if (periodId === "ytd") {
+    const lastYearSameSpan = new Date(now.getFullYear() - 1, 0, 1);
+    const lastYearSameDay = new Date(now.getFullYear() - 1, now.getMonth(), now.getDate(), 23, 59, 59, 999);
+    return { start: lastYearSameSpan, end: lastYearSameDay };
+  }
+  if (periodId === "last_30") return { start: new Date(now.getTime() - 60 * 86400_000), end: new Date(now.getTime() - 30 * 86400_000) };
+  if (periodId === "last_90") return { start: new Date(now.getTime() - 180 * 86400_000), end: new Date(now.getTime() - 90 * 86400_000) };
+  if (periodId === "last_12_months") {
+    return { start: new Date(now.getFullYear() - 1, now.getMonth() - 11, 1), end: new Date(now.getFullYear() - 1, now.getMonth(), now.getDate()) };
+  }
+  return null; // No prior comparison for "all time"
+}
+
+function orderInRange(order, start, end) {
+  if (!order.date) return false;
+  const d = new Date(order.date + (order.date.length === 10 ? "T00:00:00" : ""));
+  if (isNaN(d)) return false;
+  if (start && d < start) return false;
+  if (end && d > end) return false;
+  return true;
+}
+
+function pctChange(current, prior) {
+  if (prior === 0 || prior === null || prior === undefined) {
+    return current === 0 ? 0 : null; // null = no comparison possible
+  }
+  return ((current - prior) / Math.abs(prior)) * 100;
+}
+
+function ReportsView({ orders, customers, products, salesReps }) {
+  const [period, setPeriod] = useState("this_month");
+  const [threshold, setThreshold] = useState(30);
+  const [includeNeverOrdered, setIncludeNeverOrdered] = useState(false);
+
+  // Active orders only — deleted ones don't count for any reporting
+  const activeOrders = useMemo(() => orders.filter((o) => !o.deletedAt), [orders]);
+
+  const { start, end, label: periodLabel } = reportPeriodRange(period);
+  const ordersInPeriod = useMemo(
+    () => activeOrders.filter((o) => orderInRange(o, start, end)),
+    [activeOrders, start, end]
+  );
+
+  const priorRange = priorPeriodRange(period);
+  const ordersInPriorPeriod = useMemo(
+    () => priorRange ? activeOrders.filter((o) => orderInRange(o, priorRange.start, priorRange.end)) : null,
+    [activeOrders, priorRange]
+  );
+
+  // ----- Topline KPIs -----
+  const kpis = useMemo(() => {
+    const revenue = ordersInPeriod.reduce((s, o) => s + (Number(o.total) || 0), 0);
+    const orderCount = ordersInPeriod.length;
+    const avgOrder = orderCount > 0 ? revenue / orderCount : 0;
+    const activeCustomerIds = new Set(ordersInPeriod.map((o) => o.customerId || o.customerSnapshot?.id).filter(Boolean));
+    const activeCustomers = activeCustomerIds.size;
+
+    let priorRevenue = null, priorOrderCount = null, priorAvgOrder = null, priorActiveCustomers = null;
+    if (ordersInPriorPeriod) {
+      priorRevenue = ordersInPriorPeriod.reduce((s, o) => s + (Number(o.total) || 0), 0);
+      priorOrderCount = ordersInPriorPeriod.length;
+      priorAvgOrder = priorOrderCount > 0 ? priorRevenue / priorOrderCount : 0;
+      const priorIds = new Set(ordersInPriorPeriod.map((o) => o.customerId || o.customerSnapshot?.id).filter(Boolean));
+      priorActiveCustomers = priorIds.size;
+    }
+
+    return {
+      revenue, orderCount, avgOrder, activeCustomers,
+      revenueDelta: priorRevenue !== null ? pctChange(revenue, priorRevenue) : null,
+      orderCountDelta: priorOrderCount !== null ? pctChange(orderCount, priorOrderCount) : null,
+      avgOrderDelta: priorAvgOrder !== null ? pctChange(avgOrder, priorAvgOrder) : null,
+      activeCustomersDelta: priorActiveCustomers !== null ? pctChange(activeCustomers, priorActiveCustomers) : null,
+    };
+  }, [ordersInPeriod, ordersInPriorPeriod]);
+
+  // ----- Monthly revenue (always last 12 months, regardless of period selector) -----
+  const monthlyRevenue = useMemo(() => {
+    const now = new Date();
+    const months = [];
+    for (let i = 11; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      months.push({
+        key: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`,
+        label: d.toLocaleDateString("en-US", { month: "short", year: "2-digit" }),
+        start: d,
+        end: new Date(d.getFullYear(), d.getMonth() + 1, 0, 23, 59, 59, 999),
+        direct: 0,
+        rep: 0,
+      });
+    }
+    for (const o of activeOrders) {
+      if (!o.date) continue;
+      const d = new Date(o.date + (o.date.length === 10 ? "T00:00:00" : ""));
+      if (isNaN(d)) continue;
+      const bucket = months.find((m) => d >= m.start && d <= m.end);
+      if (!bucket) continue;
+      const total = Number(o.total) || 0;
+      if (o.salesRepId) bucket.rep += total;
+      else bucket.direct += total;
+    }
+    return months.map((m) => ({ month: m.label, Direct: Math.round(m.direct), "Rep-attributed": Math.round(m.rep) }));
+  }, [activeOrders]);
+
+  // ----- Direct vs rep breakdown (current period) -----
+  const sourceMix = useMemo(() => {
+    const repBuckets = new Map(); // repId -> revenue
+    let direct = 0;
+    for (const o of ordersInPeriod) {
+      const rev = Number(o.total) || 0;
+      if (o.salesRepId) {
+        repBuckets.set(o.salesRepId, (repBuckets.get(o.salesRepId) || 0) + rev);
+      } else {
+        direct += rev;
+      }
+    }
+    const result = [];
+    if (direct > 0) result.push({ name: "Direct", value: Math.round(direct) });
+    for (const [repId, val] of repBuckets) {
+      const rep = salesReps.find((r) => r.id === repId);
+      const name = rep?.name || ordersInPeriod.find((o) => o.salesRepId === repId)?.salesRepSnapshot?.name || "Unknown rep";
+      result.push({ name, value: Math.round(val) });
+    }
+    return result.sort((a, b) => b.value - a.value);
+  }, [ordersInPeriod, salesReps]);
+
+  // ----- Top customers -----
+  const topCustomers = useMemo(() => {
+    const map = new Map();
+    for (const o of ordersInPeriod) {
+      const id = o.customerId || o.customerSnapshot?.id;
+      if (!id) continue;
+      const name = o.customerSnapshot?.name || "Unknown";
+      const cur = map.get(id) || { id, name, revenue: 0, orderCount: 0, lastDate: null };
+      cur.revenue += Number(o.total) || 0;
+      cur.orderCount += 1;
+      const orderDate = o.date ? new Date(o.date + (o.date.length === 10 ? "T00:00:00" : "")) : null;
+      if (orderDate && (!cur.lastDate || orderDate > cur.lastDate)) cur.lastDate = orderDate;
+      map.set(id, cur);
+    }
+    return Array.from(map.values()).sort((a, b) => b.revenue - a.revenue).slice(0, 10);
+  }, [ordersInPeriod]);
+
+  // ----- Top products -----
+  const topProducts = useMemo(() => {
+    const map = new Map(); // key by description (since products may not all have a productId)
+    for (const o of ordersInPeriod) {
+      for (const li of (o.lineItems || [])) {
+        const key = (li.description || "").split(",")[0].trim() || "(unnamed)";
+        const cur = map.get(key) || { name: key, revenue: 0, units: 0, orderCount: 0, _orderIds: new Set() };
+        cur.revenue += Number(li.amount) || 0;
+        cur.units += (Number(li.quantity) || 0) * (Number(li.packCount) || 1);
+        cur._orderIds.add(o.id);
+        map.set(key, cur);
+      }
+    }
+    return Array.from(map.values())
+      .map((p) => ({ ...p, orderCount: p._orderIds.size }))
+      .sort((a, b) => b.revenue - a.revenue)
+      .slice(0, 10);
+  }, [ordersInPeriod]);
+
+  // Top products as donut (top 5 + Other)
+  const productMix = useMemo(() => {
+    if (topProducts.length === 0) return [];
+    const top5 = topProducts.slice(0, 5);
+    const others = topProducts.slice(5).reduce((s, p) => s + p.revenue, 0);
+    const result = top5.map((p) => ({ name: p.name, value: Math.round(p.revenue) }));
+    if (others > 0) result.push({ name: "Other", value: Math.round(others) });
+    return result;
+  }, [topProducts]);
+
+  // ----- Sales rep performance (period) -----
+  const repPerformance = useMemo(() => {
+    const map = new Map();
+    for (const o of ordersInPeriod) {
+      if (!o.salesRepId) continue;
+      const cur = map.get(o.salesRepId) || {
+        repId: o.salesRepId,
+        repName: o.salesRepSnapshot?.name || "Unknown",
+        revenue: 0, orderCount: 0,
+      };
+      cur.revenue += Number(o.total) || 0;
+      cur.orderCount += 1;
+      map.set(o.salesRepId, cur);
+    }
+    return Array.from(map.values())
+      .map((r) => ({ ...r, avgOrder: r.orderCount > 0 ? r.revenue / r.orderCount : 0 }))
+      .sort((a, b) => b.revenue - a.revenue);
+  }, [ordersInPeriod]);
+
+  // ----- Dormant customers (independent of period selector — always relative to "now") -----
+  const customerStats = useMemo(() => {
+    const map = new Map();
+    for (const o of activeOrders) {
+      const cid = o.customerId || o.customerSnapshot?.id;
+      if (!cid) continue;
+      const orderDate = o.date ? new Date(o.date + (o.date.length === 10 ? "T00:00:00" : "")) : null;
+      if (!orderDate || isNaN(orderDate)) continue;
+      const cur = map.get(cid) || { lastOrderDate: null, totalOrders: 0, totalRevenue: 0 };
+      if (!cur.lastOrderDate || orderDate > cur.lastOrderDate) cur.lastOrderDate = orderDate;
+      cur.totalOrders += 1;
+      cur.totalRevenue += Number(o.total) || 0;
+      map.set(cid, cur);
+    }
+    return map;
+  }, [activeOrders]);
+
+  const dormant = useMemo(() => {
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - threshold);
+    cutoff.setHours(0, 0, 0, 0);
+    const rows = [];
+    for (const c of customers) {
+      const stats = customerStats.get(c.id);
+      if (!stats) {
+        if (includeNeverOrdered) {
+          rows.push({ customer: c, lastOrderDate: null, daysSince: null, totalOrders: 0, totalRevenue: 0, neverOrdered: true });
+        }
+        continue;
+      }
+      if (stats.lastOrderDate < cutoff) {
+        const daysSince = Math.floor((Date.now() - stats.lastOrderDate.getTime()) / 86400_000);
+        rows.push({ customer: c, lastOrderDate: stats.lastOrderDate, daysSince, totalOrders: stats.totalOrders, totalRevenue: stats.totalRevenue, neverOrdered: false });
+      }
+    }
+    rows.sort((a, b) => {
+      if (a.neverOrdered && !b.neverOrdered) return 1;
+      if (!a.neverOrdered && b.neverOrdered) return -1;
+      if (a.neverOrdered && b.neverOrdered) return (a.customer.name || "").localeCompare(b.customer.name || "");
+      return b.daysSince - a.daysSince;
+    });
+    return rows;
+  }, [customers, customerStats, threshold, includeNeverOrdered]);
+
+  const exportDormantCSV = () => {
+    const headers = ["Customer", "Customer ID", "Contact", "Email", "Phone", "Last Order Date", "Days Since Last Order", "Total Orders", "Total Revenue"];
+    const rows = dormant.map((r) => [
+      r.customer.name || "", r.customer.customerId || "", r.customer.contactName || "",
+      r.customer.email || "", r.customer.phone || "",
+      r.lastOrderDate ? r.lastOrderDate.toISOString().slice(0, 10) : "Never",
+      r.daysSince !== null ? r.daysSince : "",
+      r.totalOrders, r.totalRevenue.toFixed(2),
+    ]);
+    downloadCSV(`dormant-customers-${threshold}d-${todayStamp()}.csv`, rowsToCSV(headers, rows));
+  };
+
+  return (
+    <div className="space-y-6">
+      <header className="flex items-end justify-between flex-wrap gap-3">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">Reports</h1>
+          <p className="text-sm text-stone-500 mt-0.5">Sales metrics for {periodLabel}.</p>
+        </div>
+        <select
+          value={period}
+          onChange={(e) => setPeriod(e.target.value)}
+          className="h-10 px-3 border border-stone-200 rounded text-sm bg-white"
+        >
+          {REPORT_PERIODS.map((p) => (
+            <option key={p.id} value={p.id}>{p.label}</option>
+          ))}
+        </select>
+      </header>
+
+      {/* ----- KPI cards ----- */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <KpiCard label="Revenue" value={fmtUSD(kpis.revenue)} delta={kpis.revenueDelta} />
+        <KpiCard label="Orders" value={kpis.orderCount.toLocaleString()} delta={kpis.orderCountDelta} />
+        <KpiCard label="Avg order value" value={fmtUSD(kpis.avgOrder)} delta={kpis.avgOrderDelta} />
+        <KpiCard label="Active customers" value={kpis.activeCustomers.toLocaleString()} delta={kpis.activeCustomersDelta} />
+      </div>
+
+      {/* ----- Monthly revenue chart ----- */}
+      <Card>
+        <h2 className="font-semibold mb-1">Revenue, last 12 months</h2>
+        <p className="text-xs text-stone-500 mb-4">
+          Stacked bars show direct vs rep-attributed revenue per month.
+          Hover any bar for the breakdown.
+        </p>
+        <div style={{ width: "100%", height: 280 }}>
+          <ResponsiveContainer>
+            <BarChart data={monthlyRevenue} margin={{ top: 5, right: 10, bottom: 5, left: 0 }}>
+              <CartesianGrid stroke="#e7e5e4" vertical={false} />
+              <XAxis dataKey="month" tick={{ fontSize: 11, fill: "#78716c" }} axisLine={{ stroke: "#d6d3d1" }} tickLine={false} />
+              <YAxis tick={{ fontSize: 11, fill: "#78716c" }} axisLine={false} tickLine={false} tickFormatter={(v) => v >= 1000 ? `$${(v / 1000).toFixed(0)}k` : `$${v}`} />
+              <RTooltip
+                cursor={{ fill: "#f5f5f4" }}
+                contentStyle={{ fontSize: 12, border: "1px solid #d6d3d1", borderRadius: 4 }}
+                formatter={(value) => fmtUSD(value)}
+              />
+              <Legend wrapperStyle={{ fontSize: 12 }} />
+              <Bar dataKey="Direct" stackId="a" fill="#1c1917" />
+              <Bar dataKey="Rep-attributed" stackId="a" fill="#a8a29e" />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      </Card>
+
+      {/* ----- Mix donuts ----- */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <Card>
+          <h2 className="font-semibold mb-1">Revenue source ({periodLabel})</h2>
+          <p className="text-xs text-stone-500 mb-3">Direct sales vs each sales rep.</p>
+          {sourceMix.length === 0 ? (
+            <Empty msg="No revenue in this period." />
+          ) : (
+            <DonutChart data={sourceMix} />
+          )}
+        </Card>
+        <Card>
+          <h2 className="font-semibold mb-1">Top products by revenue ({periodLabel})</h2>
+          <p className="text-xs text-stone-500 mb-3">Top 5 + others combined.</p>
+          {productMix.length === 0 ? (
+            <Empty msg="No products sold in this period." />
+          ) : (
+            <DonutChart data={productMix} />
+          )}
+        </Card>
+      </div>
+
+      {/* ----- Top tables ----- */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <Card>
+          <h2 className="font-semibold mb-3">Top customers</h2>
+          {topCustomers.length === 0 ? (
+            <Empty msg="No customer activity in this period." />
+          ) : (
+            <table className="w-full text-sm">
+              <thead className="text-left text-xs text-stone-500 uppercase tracking-wider border-b border-stone-200">
+                <tr>
+                  <th className="py-2 pr-2 font-medium">Customer</th>
+                  <th className="py-2 px-2 font-medium text-right">Orders</th>
+                  <th className="py-2 pl-2 font-medium text-right">Revenue</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-stone-100">
+                {topCustomers.map((c) => (
+                  <tr key={c.id}>
+                    <td className="py-2 pr-2 font-medium truncate max-w-[200px]" title={c.name}>{c.name}</td>
+                    <td className="py-2 px-2 text-right tabular-nums">{c.orderCount}</td>
+                    <td className="py-2 pl-2 text-right tabular-nums font-medium">{fmtUSD(c.revenue)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </Card>
+
+        <Card>
+          <h2 className="font-semibold mb-3">Top products</h2>
+          {topProducts.length === 0 ? (
+            <Empty msg="No products sold in this period." />
+          ) : (
+            <table className="w-full text-sm">
+              <thead className="text-left text-xs text-stone-500 uppercase tracking-wider border-b border-stone-200">
+                <tr>
+                  <th className="py-2 pr-2 font-medium">Product</th>
+                  <th className="py-2 px-2 font-medium text-right">Orders</th>
+                  <th className="py-2 px-2 font-medium text-right">Units</th>
+                  <th className="py-2 pl-2 font-medium text-right">Revenue</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-stone-100">
+                {topProducts.map((p, i) => (
+                  <tr key={i}>
+                    <td className="py-2 pr-2 font-medium truncate max-w-[180px]" title={p.name}>{p.name}</td>
+                    <td className="py-2 px-2 text-right tabular-nums">{p.orderCount}</td>
+                    <td className="py-2 px-2 text-right tabular-nums">{p.units}</td>
+                    <td className="py-2 pl-2 text-right tabular-nums font-medium">{fmtUSD(p.revenue)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </Card>
+      </div>
+
+      {/* ----- Sales rep performance ----- */}
+      {repPerformance.length > 0 && (
+        <Card>
+          <h2 className="font-semibold mb-3">Sales rep performance ({periodLabel})</h2>
+          <table className="w-full text-sm">
+            <thead className="text-left text-xs text-stone-500 uppercase tracking-wider border-b border-stone-200">
+              <tr>
+                <th className="py-2 pr-2 font-medium">Rep</th>
+                <th className="py-2 px-2 font-medium text-right">Orders</th>
+                <th className="py-2 px-2 font-medium text-right">Avg order</th>
+                <th className="py-2 pl-2 font-medium text-right">Revenue</th>
+                <th className="py-2 pl-4 font-medium text-right">% of total</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-stone-100">
+              {repPerformance.map((r) => (
+                <tr key={r.repId}>
+                  <td className="py-2 pr-2 font-medium">{r.repName}</td>
+                  <td className="py-2 px-2 text-right tabular-nums">{r.orderCount}</td>
+                  <td className="py-2 px-2 text-right tabular-nums">{fmtUSD(r.avgOrder)}</td>
+                  <td className="py-2 pl-2 text-right tabular-nums font-medium">{fmtUSD(r.revenue)}</td>
+                  <td className="py-2 pl-4 text-right tabular-nums text-stone-500">
+                    {kpis.revenue > 0 ? `${((r.revenue / kpis.revenue) * 100).toFixed(1)}%` : "—"}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </Card>
+      )}
+
+      {/* ----- Dormant customers (existing) ----- */}
+      <Card>
+        <div className="flex items-end justify-between gap-3 mb-4 flex-wrap">
+          <div>
+            <h2 className="font-semibold">Reorder follow-up</h2>
+            <p className="text-xs text-stone-500 mt-0.5">
+              Customers who haven't ordered recently. Useful for proactive outreach before they buy from a competitor.
+            </p>
+          </div>
+          <div className="flex gap-2 items-center">
+            <select
+              value={threshold}
+              onChange={(e) => setThreshold(Number(e.target.value))}
+              className="h-10 px-3 border border-stone-200 rounded text-sm bg-white"
+            >
+              {DORMANT_THRESHOLDS.map((t) => (
+                <option key={t.id} value={t.id}>{t.label}</option>
+              ))}
+            </select>
+            <label className="flex items-center gap-1.5 text-xs text-stone-600 px-2 cursor-pointer whitespace-nowrap">
+              <input
+                type="checkbox"
+                checked={includeNeverOrdered}
+                onChange={(e) => setIncludeNeverOrdered(e.target.checked)}
+              />
+              Include never-ordered
+            </label>
+            <button
+              onClick={exportDormantCSV}
+              disabled={dormant.length === 0}
+              className="px-3 py-2 border border-stone-300 text-sm rounded hover:bg-stone-50 flex items-center gap-1.5 disabled:opacity-40"
+            >
+              <Download className="w-4 h-4" /> Export CSV
+            </button>
+          </div>
+        </div>
+
+        {dormant.length === 0 ? (
+          <Empty msg={
+            customers.length === 0
+              ? "No customers yet."
+              : `Great — every customer has ordered within the last ${threshold} days.`
+          } />
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead className="text-left text-xs text-stone-500 uppercase tracking-wider border-b border-stone-200">
+                <tr>
+                  <th className="py-2 pr-4 font-medium">Customer</th>
+                  <th className="py-2 pr-4 font-medium">Contact</th>
+                  <th className="py-2 pr-4 font-medium">Last order</th>
+                  <th className="py-2 pr-4 font-medium text-right">Days since</th>
+                  <th className="py-2 pr-4 font-medium text-right">Past orders</th>
+                  <th className="py-2 pr-4 font-medium text-right">Lifetime revenue</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-stone-100">
+                {dormant.map((r) => (
+                  <tr key={r.customer.id}>
+                    <td className="py-2.5 pr-4">
+                      <div className="font-medium">{r.customer.name}</div>
+                      {r.customer.customerId && <div className="text-xs text-stone-500 font-mono">#{r.customer.customerId}</div>}
+                    </td>
+                    <td className="py-2.5 pr-4">
+                      {r.customer.contactName && <div>{r.customer.contactName}</div>}
+                      <div className="text-xs text-stone-500">
+                        {[r.customer.email, r.customer.phone].filter(Boolean).join(" · ")}
+                      </div>
+                    </td>
+                    <td className="py-2.5 pr-4 text-stone-600">
+                      {r.neverOrdered ? (
+                        <span className="text-xs uppercase tracking-wider text-amber-700 bg-amber-50 px-1.5 py-0.5 rounded">Never ordered</span>
+                      ) : (
+                        r.lastOrderDate.toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" })
+                      )}
+                    </td>
+                    <td className="py-2.5 pr-4 text-right tabular-nums">
+                      {r.daysSince !== null ? (
+                        <span className={r.daysSince >= 90 ? "text-red-700 font-medium" : r.daysSince >= 60 ? "text-amber-700" : ""}>
+                          {r.daysSince}
+                        </span>
+                      ) : "—"}
+                    </td>
+                    <td className="py-2.5 pr-4 text-right tabular-nums">{r.totalOrders}</td>
+                    <td className="py-2.5 pr-4 text-right tabular-nums">{fmtUSD(r.totalRevenue)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {dormant.length > 0 && (
+          <div className="mt-4 pt-3 border-t border-stone-200 text-xs text-stone-500">
+            Showing <span className="font-medium text-stone-700">{dormant.length}</span> customer{dormant.length === 1 ? "" : "s"} who haven't ordered in {threshold}+ days{includeNeverOrdered ? " (including never-ordered)" : ""}.
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+/* ---------- Reusable KPI card with optional vs-prior delta ---------- */
+
+function KpiCard({ label, value, delta }) {
+  let deltaUI = null;
+  if (delta !== null && delta !== undefined) {
+    const pct = Math.abs(delta).toFixed(1);
+    if (Math.abs(delta) < 0.5) {
+      deltaUI = (
+        <span className="text-xs text-stone-500 flex items-center gap-1">
+          <Minus className="w-3 h-3" /> flat vs prior
+        </span>
+      );
+    } else if (delta > 0) {
+      deltaUI = (
+        <span className="text-xs text-emerald-700 flex items-center gap-1">
+          <TrendingUp className="w-3 h-3" /> {pct}% vs prior
+        </span>
+      );
+    } else {
+      deltaUI = (
+        <span className="text-xs text-red-700 flex items-center gap-1">
+          <TrendingDown className="w-3 h-3" /> {pct}% vs prior
+        </span>
+      );
+    }
+  }
+  return (
+    <Card>
+      <div className="text-xs uppercase tracking-wider text-stone-500 font-medium">{label}</div>
+      <div className="text-2xl font-semibold tracking-tight mt-1 tabular-nums">{value}</div>
+      <div className="mt-1 h-4">{deltaUI}</div>
+    </Card>
+  );
+}
+
+/* ---------- Reusable donut chart with side legend ---------- */
+
+function DonutChart({ data }) {
+  const total = data.reduce((s, d) => s + d.value, 0);
+  return (
+    <div className="flex items-center gap-4 flex-wrap">
+      <div style={{ width: 180, height: 180, flexShrink: 0 }}>
+        <ResponsiveContainer>
+          <PieChart>
+            <Pie
+              data={data}
+              dataKey="value"
+              nameKey="name"
+              cx="50%"
+              cy="50%"
+              innerRadius={45}
+              outerRadius={80}
+              paddingAngle={1}
+            >
+              {data.map((entry, i) => (
+                <Cell key={i} fill={CHART_COLORS[i % CHART_COLORS.length]} />
+              ))}
+            </Pie>
+            <RTooltip
+              contentStyle={{ fontSize: 12, border: "1px solid #d6d3d1", borderRadius: 4 }}
+              formatter={(value) => fmtUSD(value)}
+            />
+          </PieChart>
+        </ResponsiveContainer>
+      </div>
+      <div className="flex-1 min-w-0 text-sm space-y-1.5">
+        {data.map((d, i) => {
+          const pct = total > 0 ? (d.value / total) * 100 : 0;
+          return (
+            <div key={i} className="flex items-center gap-2">
+              <span className="w-2.5 h-2.5 rounded shrink-0" style={{ background: CHART_COLORS[i % CHART_COLORS.length] }} />
+              <span className="flex-1 truncate min-w-0" title={d.name}>{d.name}</span>
+              <span className="tabular-nums text-stone-500 text-xs">{pct.toFixed(0)}%</span>
+              <span className="tabular-nums font-medium w-20 text-right">{fmtUSD(d.value)}</span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function SettingsView({ company, fedex, counters, customers, products, orders, onSaveCompany, onSaveFedex, onSaveCounters }) {
   const [c, setC] = useState(company);
   const [f, setF] = useState(fedex);
   const [ct, setCt] = useState(counters);
@@ -2886,6 +3708,15 @@ function SettingsView({ company, fedex, counters, onSaveCompany, onSaveFedex, on
       </header>
 
       <DataSyncCard />
+
+      <BackupCard
+        company={company}
+        fedex={fedex}
+        counters={counters}
+        customers={customers}
+        products={products}
+        orders={orders}
+      />
 
       <SalesRepsCard
         reps={c.salesReps || []}
