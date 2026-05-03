@@ -3,7 +3,7 @@ import {
   Package, Users, FlaskConical, FileText, Settings as SettingsIcon,
   Plus, Trash2, Pencil, Search, Printer, Truck, X, Check,
   ChevronRight, AlertCircle, Loader2, Copy, ClipboardCheck, DollarSign, Download, MapPin, Briefcase,
-  TrendingUp, TrendingDown, Minus,
+  TrendingUp, TrendingDown, Minus, Mail,
 } from "lucide-react";
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip as RTooltip, ResponsiveContainer,
@@ -224,6 +224,42 @@ function formatProductNames(lineItems) {
   return `${unique.slice(0, 3).join(", ")} +${unique.length - 3} more`;
 }
 
+/* ---------- Tracking email template fill-in ---------- */
+
+function fillTrackingTemplate(template, { order, company }) {
+  const c = order.customerSnapshot || {};
+  const contact = c.contactName || c.name || "there";
+  const itemsList = (order.lineItems || []).map((li) => {
+    const qty = li.quantity ? `${li.quantity}${(li.unit || "g").toLowerCase().slice(0, 1)}` : "";
+    const desc = li.description || "";
+    return `  - ${desc}${qty ? ` (${qty})` : ""}`;
+  }).join("\n");
+
+  return template
+    .replaceAll("{contact}", contact)
+    .replaceAll("{customer}", c.name || "")
+    .replaceAll("{invoice}", order.invoiceNumber || "")
+    .replaceAll("{tracking}", order.tracking || "")
+    .replaceAll("{service}", order.shipService || "")
+    .replaceAll("{total}", fmtUSD(order.total || 0))
+    .replaceAll("{date}", niceDate(order.date))
+    .replaceAll("{company}", company.name || "")
+    .replaceAll("{signatory}", company.signatoryName || company.name || "")
+    .replaceAll("{po}", order.poNumber || "")
+    .replaceAll("{poLine}", order.poNumber ? `Customer PO: ${order.poNumber}\n\n` : "")
+    .replaceAll("{itemsLine}", itemsList ? `Contents:\n${itemsList}\n\n` : "")
+    .replaceAll("{items}", itemsList);
+}
+
+function buildTrackingMailto({ order, company, template }) {
+  const c = order.customerSnapshot || {};
+  const to = c.email || "";
+  const subject = fillTrackingTemplate(template?.subject || "", { order, company });
+  const body = fillTrackingTemplate(template?.body || "", { order, company });
+  // mailto links require the body and subject to be URL-encoded
+  return `mailto:${encodeURIComponent(to)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+}
+
 /* ---------- Per-entity CSV exports ---------- */
 
 function exportCustomersCSV(customers) {
@@ -253,14 +289,14 @@ function exportCustomersCSV(customers) {
 function exportProductsCSV(products) {
   const headers = [
     "Name", "CAS Number", "Default Unit", "Default Price (USD)",
-    "Default Pack Size", "Current Batch #", "Default Description", "Notes",
+    "Pack Sizes", "Current Batch #", "Default Description", "Notes",
   ];
   const rows = products.map((p) => [
     p.name || "",
     p.casNumber || "",
     p.defaultUnit || "",
     p.defaultPrice || "",
-    p.defaultPackSize || "",
+    productPackSizes(p).join("; "),
     p.batchNumber || "",
     p.defaultDescription || "",
     p.notes || "",
@@ -337,6 +373,52 @@ function exportOrdersLineItemsCSV(orders) {
   downloadCSV(`order-line-items-${todayStamp()}.csv`, rowsToCSV(headers, rows));
 }
 
+const DEFAULT_EMAIL_TEMPLATES = [
+  {
+    id: "shipped_standard",
+    name: "Shipped — standard",
+    subject: "Your order from {company} has shipped — Tracking {tracking} (Invoice attached)",
+    body: `Hi {contact},
+
+Your order #{invoice} from {company} shipped today via FedEx. The invoice is attached for your records.
+
+Tracking number: {tracking}
+Track here: https://www.fedex.com/fedextrack/?trknbr={tracking}
+
+{poLine}{itemsLine}Please let us know if anything looks off when the package arrives.
+
+Thanks,
+{signatory}
+{company}`,
+  },
+  {
+    id: "shipped_brief",
+    name: "Shipped — short",
+    subject: "Order #{invoice} shipped — {tracking} (Invoice attached)",
+    body: `Hi {contact},
+
+Your order has shipped. Invoice attached. Tracking: {tracking}
+
+https://www.fedex.com/fedextrack/?trknbr={tracking}
+
+{signatory}`,
+  },
+  {
+    id: "delivery_followup",
+    name: "Follow-up — confirm delivery",
+    subject: "Did your order from {company} arrive okay?",
+    body: `Hi {contact},
+
+Just following up on order #{invoice} that we shipped a few days ago (tracking {tracking}). Wanted to make sure it arrived in good condition and everything met your expectations.
+
+If anything's off — packaging, quantities, paperwork — please let me know and we'll make it right.
+
+Thanks,
+{signatory}
+{company}`,
+  },
+];
+
 const DEFAULT_COMPANY = {
   name: "RefDrug",
   addressLine1: "",
@@ -358,6 +440,12 @@ const DEFAULT_COMPANY = {
   signatureDataUrl: "",
   sealDataUrl: "",
   salesReps: [], // [{ id, name, email, notes }]
+  packagePresets: [
+    { id: "small", name: "Small box", length: 6, width: 6, height: 4 },
+    { id: "medium", name: "Medium box", length: 10, width: 8, height: 4 },
+    { id: "large", name: "Large box", length: 12, width: 10, height: 6 },
+  ],
+  emailTemplates: DEFAULT_EMAIL_TEMPLATES,
 };
 
 const DEFAULT_FEDEX = {
@@ -630,6 +718,7 @@ export default function App() {
               }}
               salesReps={company.salesReps || []}
               onAssignRep={assignSalesRep}
+              company={company}
             />
           )}
           {view === "commissions" && (
@@ -732,7 +821,7 @@ function NewOrder({ customers, products, counters, company, fedex, orders, onSav
   const [invoiceNumber, setInvoiceNumber] = useState(formatInvoice(counters.invoice, company));
   const [shipping, setShipping] = useState(0);
   const [lineItems, setLineItems] = useState([]);
-  const [shipWeightLbs, setShipWeightLbs] = useState(2);
+  const [shipWeightLbs, setShipWeightLbs] = useState("");
   const [shipDims, setShipDims] = useState({ length: 10, width: 8, height: 4 });
   const [shipService, setShipService] = useState(fedex.defaultService || "FEDEX_GROUND");
   const [signatureRequired, setSignatureRequired] = useState(false);
@@ -759,7 +848,7 @@ function NewOrder({ customers, products, counters, company, fedex, orders, onSav
     setCustomerId(o.customerId || (o.customerSnapshot?.id) || "");
     setLineItems((o.lineItems || []).map((li) => ({ ...li, id: li.id || newId() })));
     setShipping(o.shipping || 0);
-    setShipWeightLbs(o.shipWeightLbs || 2);
+    setShipWeightLbs(o.shipWeightLbs || "");
     setShipDims(o.shipDims || { length: 10, width: 8, height: 4 });
     setShipService(o.shipService || fedex.defaultService || "FEDEX_GROUND");
     setSignatureRequired(!!o.signatureRequired);
@@ -792,7 +881,6 @@ function NewOrder({ customers, products, counters, company, fedex, orders, onSav
         unit: "Gram",
         quantity: 0,
         unitPriceNum: 0,
-        unitPriceDisplay: "",
         amount: 0,
         batchNumber: "",
         packSize: "",
@@ -811,8 +899,15 @@ function NewOrder({ customers, products, counters, company, fedex, orders, onSav
           const qty = Number(merged.quantity) || 0;
           const price = Number(merged.unitPriceNum) || 0;
           merged.amount = +(qty * price).toFixed(2);
-          if (!merged.unitPriceDisplay && price > 0) {
-            merged.unitPriceDisplay = `$${price}/${(merged.unit || "g").toLowerCase().slice(0, 1)}`;
+        }
+        // Auto-rebuild description if user hasn't manually overridden it,
+        // and packCount/packSize changed
+        if (("packCount" in patch || "packSize" in patch) && merged.productName) {
+          // Only rebuild if the current description still matches the auto-format —
+          // this protects manual edits the user has made
+          const expectedOld = buildLineDescription(merged.productName, it.packCount, it.packSize);
+          if (it.description === expectedOld || !it.description) {
+            merged.description = buildLineDescription(merged.productName, merged.packCount, merged.packSize);
           }
         }
         return merged;
@@ -826,15 +921,17 @@ function NewOrder({ customers, products, counters, company, fedex, orders, onSav
       updateLine(lineId, { productId: "" });
       return;
     }
+    const packSizes = productPackSizes(p);
+    const firstPackSize = packSizes[0] || "";
     updateLine(lineId, {
       productId: p.id,
-      description: p.defaultDescription || `${p.name}${p.defaultPackSize ? ", " + p.defaultPackSize : ""}`,
+      productName: p.name || "",
+      description: buildLineDescription(p.name, 1, firstPackSize),
       casNumber: p.casNumber || "",
       unit: p.defaultUnit || "Gram",
       unitPriceNum: Number(p.defaultPrice) || 0,
-      unitPriceDisplay: p.defaultPrice ? `$${p.defaultPrice}/g` : "",
       batchNumber: p.batchNumber || "",
-      packSize: p.defaultPackSize || "",
+      packSize: firstPackSize,
     });
   };
 
@@ -1040,6 +1137,7 @@ function NewOrder({ customers, products, counters, company, fedex, orders, onSav
     setDate(today());
     setShipping(0);
     setLineItems([]);
+    setShipWeightLbs("");
     setShippingState({ status: "idle", tracking: null, labelBase64: null, error: null });
     setSavedOrderId(null);
     setInvoiceNumber(formatInvoice(counters.invoice, company));
@@ -1166,7 +1264,36 @@ function NewOrder({ customers, products, counters, company, fedex, orders, onSav
 
       {/* --- Shipping params --- */}
       <Card>
-        <h2 className="font-semibold mb-3">Shipping parameters</h2>
+        <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+          <h2 className="font-semibold">Shipping parameters</h2>
+          {(company.packagePresets || []).length > 0 && (
+            <div className="flex items-center gap-2">
+              <label className="text-xs text-stone-500 font-medium">Package preset:</label>
+              <select
+                value=""
+                onChange={(e) => {
+                  if (!e.target.value) return;
+                  const preset = (company.packagePresets || []).find((p) => p.id === e.target.value);
+                  if (!preset) return;
+                  setShipDims({
+                    length: preset.length || 0,
+                    width: preset.width || 0,
+                    height: preset.height || 0,
+                  });
+                  e.target.value = "";
+                }}
+                className="h-9 px-2 border border-stone-200 rounded text-sm bg-white"
+              >
+                <option value="">Choose a preset…</option>
+                {(company.packagePresets || []).map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name} — {p.length}×{p.width}×{p.height} in
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+        </div>
         <div className="grid grid-cols-2 md:grid-cols-6 gap-3">
           <Field label="Weight (lb)">
             <input type="number" step="0.1" value={shipWeightLbs} onChange={(e) => setShipWeightLbs(e.target.value)} className={inputCls} />
@@ -1394,6 +1521,8 @@ function LineItemRow({ index, line, products, onChange, onPick, onRemove }) {
       <div className="flex items-start gap-3">
         <div className="text-xs text-stone-400 font-mono pt-2 w-6">{index + 1}.</div>
         <div className="flex-1 grid grid-cols-12 gap-2">
+
+          {/* Row 1: Product, Description, CAS, Batch # */}
           <div className="col-span-12 md:col-span-3">
             <label className="text-[10px] uppercase tracking-wider text-stone-500 font-medium">Product</label>
             <select
@@ -1413,7 +1542,7 @@ function LineItemRow({ index, line, products, onChange, onPick, onRemove }) {
               value={line.description}
               onChange={(e) => onChange({ description: e.target.value })}
               className={inputCls + " mt-1"}
-              placeholder="e.g. Dihexa, 5x10g bottle"
+              placeholder="e.g. Dihexa, 5x10g"
             />
           </div>
           <div className="col-span-6 md:col-span-2">
@@ -1424,15 +1553,18 @@ function LineItemRow({ index, line, products, onChange, onPick, onRemove }) {
               className={inputCls + " mt-1 font-mono text-xs"}
             />
           </div>
-          <div className="col-span-6 md:col-span-1">
-            <label className="text-[10px] uppercase tracking-wider text-stone-500 font-medium">Unit</label>
+          <div className="col-span-6 md:col-span-3">
+            <label className="text-[10px] uppercase tracking-wider text-stone-500 font-medium">Batch #</label>
             <input
-              value={line.unit}
-              onChange={(e) => onChange({ unit: e.target.value })}
-              className={inputCls + " mt-1"}
+              value={line.batchNumber}
+              onChange={(e) => onChange({ batchNumber: e.target.value })}
+              className={inputCls + " mt-1 font-mono text-xs"}
+              placeholder="HXDHX251001"
             />
           </div>
-          <div className="col-span-4 md:col-span-1">
+
+          {/* Row 2: Qty, Unit, Pack size, Pack count, $/Unit, Amount */}
+          <div className="col-span-4 md:col-span-2">
             <label className="text-[10px] uppercase tracking-wider text-stone-500 font-medium">Qty</label>
             <input
               type="number"
@@ -1443,57 +1575,59 @@ function LineItemRow({ index, line, products, onChange, onPick, onRemove }) {
             />
           </div>
           <div className="col-span-4 md:col-span-1">
+            <label className="text-[10px] uppercase tracking-wider text-stone-500 font-medium">Unit</label>
+            <input
+              value={line.unit}
+              onChange={(e) => onChange({ unit: e.target.value })}
+              className={inputCls + " mt-1"}
+            />
+          </div>
+          <div className="col-span-6 md:col-span-3">
+            <label className="text-[10px] uppercase tracking-wider text-stone-500 font-medium">Pack size</label>
+            {(() => {
+              const product = products.find((p) => p.id === line.productId);
+              const sizes = productPackSizes(product);
+              if (sizes.length === 0) {
+                return (
+                  <div className={inputCls + " mt-1 text-stone-400 flex items-center text-xs"}>
+                    Add pack sizes in Catalog
+                  </div>
+                );
+              }
+              return (
+                <select
+                  value={line.packSize || sizes[0]}
+                  onChange={(e) => onChange({ packSize: e.target.value })}
+                  className={inputCls + " mt-1"}
+                >
+                  {sizes.map((s) => <option key={s} value={s}>{s}</option>)}
+                </select>
+              );
+            })()}
+          </div>
+          <div className="col-span-6 md:col-span-2">
+            <label className="text-[10px] uppercase tracking-wider text-stone-500 font-medium">Pack count</label>
+            <input
+              type="number"
+              value={line.packCount}
+              onChange={(e) => onChange({ packCount: e.target.value })}
+              className={inputCls + " mt-1"}
+            />
+          </div>
+          <div className="col-span-6 md:col-span-2">
             <label className="text-[10px] uppercase tracking-wider text-stone-500 font-medium">$ / unit</label>
             <input
               type="number"
               step="0.01"
               value={line.unitPriceNum}
-              onChange={(e) => onChange({ unitPriceNum: e.target.value, unitPriceDisplay: `$${e.target.value}/${(line.unit || "g").toLowerCase().slice(0, 1)}` })}
+              onChange={(e) => onChange({ unitPriceNum: e.target.value })}
               className={inputCls + " mt-1"}
             />
           </div>
-          <div className="col-span-12 grid grid-cols-12 gap-2">
-            <div className="col-span-12 md:col-span-3">
-              <label className="text-[10px] uppercase tracking-wider text-stone-500 font-medium">Batch #</label>
-              <input
-                value={line.batchNumber}
-                onChange={(e) => onChange({ batchNumber: e.target.value })}
-                className={inputCls + " mt-1 font-mono text-xs"}
-                placeholder="HXDHX251001"
-              />
-            </div>
-            <div className="col-span-6 md:col-span-3">
-              <label className="text-[10px] uppercase tracking-wider text-stone-500 font-medium">Pack size (label)</label>
-              <input
-                value={line.packSize}
-                onChange={(e) => onChange({ packSize: e.target.value })}
-                className={inputCls + " mt-1"}
-                placeholder="50g/bottle"
-              />
-            </div>
-            <div className="col-span-6 md:col-span-2">
-              <label className="text-[10px] uppercase tracking-wider text-stone-500 font-medium">Pack count</label>
-              <input
-                type="number"
-                value={line.packCount}
-                onChange={(e) => onChange({ packCount: e.target.value })}
-                className={inputCls + " mt-1"}
-              />
-            </div>
-            <div className="col-span-12 md:col-span-3">
-              <label className="text-[10px] uppercase tracking-wider text-stone-500 font-medium">Display $/unit</label>
-              <input
-                value={line.unitPriceDisplay}
-                onChange={(e) => onChange({ unitPriceDisplay: e.target.value })}
-                className={inputCls + " mt-1"}
-                placeholder="$95/g"
-              />
-            </div>
-            <div className="col-span-12 md:col-span-1 flex flex-col">
-              <label className="text-[10px] uppercase tracking-wider text-stone-500 font-medium">Amount</label>
-              <div className="mt-1 h-10 flex items-center font-medium tabular-nums">
-                {fmtUSD(line.amount)}
-              </div>
+          <div className="col-span-6 md:col-span-2 flex flex-col">
+            <label className="text-[10px] uppercase tracking-wider text-stone-500 font-medium">Amount</label>
+            <div className="mt-1 h-10 flex items-center font-medium tabular-nums">
+              {fmtUSD(line.amount)}
             </div>
           </div>
         </div>
@@ -1901,7 +2035,7 @@ function ProductsView({ products, onSave, onDelete }) {
                   <th className="py-2 pr-4 font-medium">CAS</th>
                   <th className="py-2 pr-4 font-medium">Default unit</th>
                   <th className="py-2 pr-4 font-medium">Default price</th>
-                  <th className="py-2 pr-4 font-medium">Pack size</th>
+                  <th className="py-2 pr-4 font-medium">Pack sizes</th>
                   <th className="py-2 pr-4 font-medium">Batch</th>
                   <th className="py-2"></th>
                 </tr>
@@ -1913,7 +2047,18 @@ function ProductsView({ products, onSave, onDelete }) {
                     <td className="py-2.5 pr-4 font-mono text-xs">{p.casNumber}</td>
                     <td className="py-2.5 pr-4">{p.defaultUnit}</td>
                     <td className="py-2.5 pr-4 tabular-nums">{p.defaultPrice ? `$${p.defaultPrice}` : ""}</td>
-                    <td className="py-2.5 pr-4">{p.defaultPackSize}</td>
+                    <td className="py-2.5 pr-4">
+                      {(() => {
+                        const sizes = productPackSizes(p);
+                        if (sizes.length === 0) return <span className="text-stone-400">—</span>;
+                        if (sizes.length <= 3) return sizes.join(", ");
+                        return (
+                          <span title={sizes.join(", ")}>
+                            {sizes.slice(0, 3).join(", ")} <span className="text-stone-400">+{sizes.length - 3}</span>
+                          </span>
+                        );
+                      })()}
+                    </td>
                     <td className="py-2.5 pr-4 font-mono text-xs text-stone-500">{p.batchNumber}</td>
                     <td className="py-2.5 text-right whitespace-nowrap">
                       <IconButton onClick={() => setEditing(p)} icon={Pencil} title="Edit" />
@@ -1945,7 +2090,12 @@ function ProductsView({ products, onSave, onDelete }) {
             <>
               <div><span className="text-stone-500">Name:</span> <span className="font-medium">{deleteTarget.name}</span></div>
               {deleteTarget.casNumber && <div><span className="text-stone-500">CAS:</span> <span className="font-mono">{deleteTarget.casNumber}</span></div>}
-              {deleteTarget.defaultPackSize && <div><span className="text-stone-500">Pack size:</span> {deleteTarget.defaultPackSize}</div>}
+              {(() => {
+                const sizes = productPackSizes(deleteTarget);
+                return sizes.length > 0 ? (
+                  <div><span className="text-stone-500">Pack sizes:</span> {sizes.join(", ")}</div>
+                ) : null;
+              })()}
               {deleteTarget.batchNumber && <div><span className="text-stone-500">Current batch:</span> <span className="font-mono">{deleteTarget.batchNumber}</span></div>}
             </>
           }
@@ -1966,17 +2116,43 @@ function ProductForm({ initial, onSave, onCancel }) {
     casNumber: "",
     defaultUnit: "Gram",
     defaultPrice: "",
-    defaultPackSize: "",
     defaultDescription: "",
     batchNumber: "",
     notes: "",
+    packSizes: [],
     ...initial,
   });
+  const [newSize, setNewSize] = useState("");
   const set = (patch) => setP({ ...p, ...patch });
+
+  const addPackSize = () => {
+    const s = newSize.trim();
+    if (!s) return;
+    if (p.packSizes.includes(s)) {
+      setNewSize("");
+      return;
+    }
+    set({ packSizes: [...p.packSizes, s] });
+    setNewSize("");
+  };
+
+  const removePackSize = (idx) => {
+    set({ packSizes: p.packSizes.filter((_, i) => i !== idx) });
+  };
+
+  const movePackSize = (idx, direction) => {
+    const newIdx = idx + direction;
+    if (newIdx < 0 || newIdx >= p.packSizes.length) return;
+    const next = [...p.packSizes];
+    [next[idx], next[newIdx]] = [next[newIdx], next[idx]];
+    set({ packSizes: next });
+  };
+
   const submit = () => {
     if (!p.name?.trim()) return;
-    onSave(p);
+    onSave({ ...p, packSizes: p.packSizes.filter(Boolean) });
   };
+
   return (
     <div className="space-y-3">
       <div className="grid grid-cols-2 gap-3">
@@ -1992,16 +2168,67 @@ function ProductForm({ initial, onSave, onCancel }) {
         <Field label="Default price ($/unit)">
           <input type="number" step="0.01" value={p.defaultPrice} onChange={(e) => set({ defaultPrice: e.target.value })} className={inputCls} />
         </Field>
-        <Field label="Default pack size">
-          <input value={p.defaultPackSize} onChange={(e) => set({ defaultPackSize: e.target.value })} className={inputCls} placeholder="10g/bottle" />
-        </Field>
         <Field label="Current batch #">
           <input value={p.batchNumber} onChange={(e) => set({ batchNumber: e.target.value })} className={inputCls + " font-mono"} placeholder="HXDHX251001" />
         </Field>
-        <Field label="Default invoice description" wide>
+        <Field label="Default invoice description">
           <input value={p.defaultDescription} onChange={(e) => set({ defaultDescription: e.target.value })} className={inputCls} placeholder="Auto from name + pack size if blank" />
         </Field>
       </div>
+
+      {/* Pack sizes — list editor */}
+      <div className="pt-2">
+        <label className="text-xs text-stone-600 font-medium block mb-1.5">
+          Available pack sizes <span className="text-stone-400 font-normal">— shown in a dropdown when picking this product</span>
+        </label>
+        <div className="border border-stone-200 rounded">
+          {p.packSizes.length === 0 ? (
+            <div className="px-3 py-2.5 text-sm text-stone-400">No pack sizes yet — add one below.</div>
+          ) : (
+            <div className="divide-y divide-stone-100">
+              {p.packSizes.map((size, idx) => (
+                <div key={idx} className="px-3 py-2 flex items-center gap-2">
+                  <span className="text-xs text-stone-400 w-6 text-right tabular-nums">{idx + 1}.</span>
+                  <span className="flex-1 text-sm font-mono">{size}</span>
+                  <button
+                    onClick={() => movePackSize(idx, -1)}
+                    disabled={idx === 0}
+                    className="text-xs text-stone-500 hover:text-stone-900 px-1 disabled:opacity-30 disabled:cursor-not-allowed"
+                    title="Move up"
+                  >▲</button>
+                  <button
+                    onClick={() => movePackSize(idx, 1)}
+                    disabled={idx === p.packSizes.length - 1}
+                    className="text-xs text-stone-500 hover:text-stone-900 px-1 disabled:opacity-30 disabled:cursor-not-allowed"
+                    title="Move down"
+                  >▼</button>
+                  <IconButton onClick={() => removePackSize(idx)} icon={X} title="Remove" danger />
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="border-t border-stone-100 p-2 flex gap-2">
+            <input
+              value={newSize}
+              onChange={(e) => setNewSize(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addPackSize(); } }}
+              placeholder="e.g. 5g, 10g, 50g, 100g, 5g Bottle, 10mg vial"
+              className={inputCls}
+            />
+            <button
+              onClick={addPackSize}
+              disabled={!newSize.trim()}
+              className="px-3 py-1.5 text-sm rounded bg-stone-900 text-white hover:bg-stone-800 disabled:opacity-50 whitespace-nowrap"
+            >
+              Add
+            </button>
+          </div>
+        </div>
+        <div className="text-[11px] text-stone-500 mt-1.5 leading-relaxed">
+          Order matters — the first pack size becomes the default when this product is picked. Use the arrows to reorder.
+        </div>
+      </div>
+
       <div className="flex justify-end gap-2 pt-2 border-t border-stone-200">
         <button onClick={onCancel} className="px-3 py-1.5 text-sm rounded border border-stone-300 hover:bg-stone-50">Cancel</button>
         <button onClick={submit} className="px-3 py-1.5 text-sm rounded bg-stone-900 text-white hover:bg-stone-800">Save</button>
@@ -2014,9 +2241,10 @@ function ProductForm({ initial, onSave, onCancel }) {
    History
    ========================================================================= */
 
-function HistoryView({ orders, onPrint, onDelete, onEdit, salesReps, onAssignRep }) {
+function HistoryView({ orders, onPrint, onDelete, onEdit, salesReps, onAssignRep, company }) {
   const [search, setSearch] = useState("");
   const [deleteTarget, setDeleteTarget] = useState(null); // order being deleted
+  const [emailTarget, setEmailTarget] = useState(null); // order being emailed
   const [showDeleted, setShowDeleted] = useState(false);
 
   const filtered = useMemo(() => {
@@ -2161,6 +2389,20 @@ function HistoryView({ orders, onPrint, onDelete, onEdit, salesReps, onAssignRep
                           title="FedEx label"
                         />
                       )}
+                      {o.tracking && !o.deletedAt && (
+                        <IconButton
+                          onClick={() => {
+                            const email = o.customerSnapshot?.email;
+                            if (!email) {
+                              alert("This customer has no email on file. Add one to the customer record first.");
+                              return;
+                            }
+                            setEmailTarget(o);
+                          }}
+                          icon={Mail}
+                          title="Send tracking email"
+                        />
+                      )}
                       {!o.deletedAt && (
                         <IconButton onClick={() => setDeleteTarget(o)} icon={Trash2} title="Delete" danger />
                       )}
@@ -2181,6 +2423,14 @@ function HistoryView({ orders, onPrint, onDelete, onEdit, salesReps, onAssignRep
             await onDelete(deleteTarget.id, reason);
             setDeleteTarget(null);
           }}
+        />
+      )}
+
+      {emailTarget && (
+        <EmailPickerModal
+          order={emailTarget}
+          company={company}
+          onClose={() => setEmailTarget(null)}
         />
       )}
     </div>
@@ -2270,6 +2520,104 @@ function ConfirmDeleteModal({ entityType, entityName, details, onClose, onConfir
           >
             {submitting && <Loader2 className="w-4 h-4 animate-spin" />}
             Delete {entityType.toLowerCase()}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+/* ---------- Email picker — pick a template, send via mailto ---------- */
+
+function EmailPickerModal({ order, company, onClose }) {
+  const templates = company.emailTemplates || [];
+  const [selectedId, setSelectedId] = useState(templates[0]?.id || null);
+  const selected = templates.find((t) => t.id === selectedId);
+
+  const send = () => {
+    if (!selected) return;
+    window.location.href = buildTrackingMailto({ order, company, template: selected });
+    onClose();
+  };
+
+  // Build live preview of the chosen template
+  const previewSubject = selected ? fillTrackingTemplate(selected.subject || "", { order, company }) : "";
+  const previewBody = selected ? fillTrackingTemplate(selected.body || "", { order, company }) : "";
+
+  if (templates.length === 0) {
+    return (
+      <Modal onClose={onClose} title="Send tracking email">
+        <div className="space-y-4">
+          <Empty msg="No email templates yet. Add one in Settings → Tracking email templates." />
+          <div className="flex justify-end pt-3 border-t border-stone-200">
+            <button onClick={onClose} className="px-3 py-1.5 text-sm rounded border border-stone-300 hover:bg-stone-50">
+              Close
+            </button>
+          </div>
+        </div>
+      </Modal>
+    );
+  }
+
+  return (
+    <Modal onClose={onClose} title="Send tracking email">
+      <div className="space-y-4">
+        <div className="text-sm text-stone-700">
+          Sending to <span className="font-medium">{order.customerSnapshot?.email}</span> for invoice <span className="font-mono">{order.invoiceNumber}</span>.
+        </div>
+
+        <div>
+          <div className="text-xs text-stone-600 font-medium mb-2">Choose a template</div>
+          <div className="border border-stone-200 rounded divide-y divide-stone-100 max-h-[200px] overflow-y-auto">
+            {templates.map((t) => (
+              <label
+                key={t.id}
+                className={`flex items-start gap-2.5 p-3 cursor-pointer ${selectedId === t.id ? "bg-stone-50" : "hover:bg-stone-50"}`}
+              >
+                <input
+                  type="radio"
+                  name="email-template"
+                  value={t.id}
+                  checked={selectedId === t.id}
+                  onChange={() => setSelectedId(t.id)}
+                  className="mt-0.5"
+                />
+                <div className="flex-1 min-w-0">
+                  <div className="font-medium text-sm">{t.name}</div>
+                  <div className="text-xs text-stone-500 mt-0.5 truncate">
+                    {fillTrackingTemplate(t.subject || "", { order, company })}
+                  </div>
+                </div>
+              </label>
+            ))}
+          </div>
+        </div>
+
+        {selected && (
+          <div className="bg-stone-50 border border-stone-200 rounded p-3">
+            <div className="text-xs uppercase tracking-wider text-stone-500 font-medium mb-2">Preview</div>
+            <div className="text-xs text-stone-500 mb-1">Subject:</div>
+            <div className="text-sm font-medium mb-3">{previewSubject}</div>
+            <div className="text-xs text-stone-500 mb-1">Body:</div>
+            <pre className="text-xs whitespace-pre-wrap text-stone-700 font-sans leading-relaxed max-h-[240px] overflow-y-auto">{previewBody}</pre>
+          </div>
+        )}
+
+        <div className="text-xs text-stone-500 leading-relaxed">
+          Your default mail app will open with this draft. Review and click Send when ready. To attach the invoice PDF, click <span className="font-medium">Invoice (PDF)</span> on this order to download it, then drag the downloaded file into your email window.
+        </div>
+
+        <div className="flex justify-end gap-2 pt-3 border-t border-stone-200">
+          <button onClick={onClose} className="px-3 py-1.5 text-sm rounded border border-stone-300 hover:bg-stone-50">
+            Cancel
+          </button>
+          <button
+            onClick={send}
+            disabled={!selected}
+            className="px-4 py-2 bg-stone-900 text-white rounded text-sm hover:bg-stone-800 disabled:opacity-50 flex items-center gap-2"
+          >
+            <Mail className="w-4 h-4" />
+            Open in mail app
           </button>
         </div>
       </div>
@@ -2748,6 +3096,377 @@ function SalesRepForm({ initial, onSave, onCancel }) {
         <button onClick={onCancel} className="px-3 py-1.5 text-sm rounded border border-stone-300 hover:bg-stone-50">Cancel</button>
         <button onClick={() => onSave(r)} className="px-3 py-1.5 text-sm rounded bg-stone-900 text-white hover:bg-stone-800">Save</button>
       </div>
+    </div>
+  );
+}
+
+
+/* =========================================================================
+   Package presets (Settings card)
+   ========================================================================= */
+
+function PackagePresetsCard({ presets, onChange }) {
+  const [editing, setEditing] = useState(null); // { id?, name, length, width, height }
+  const [deleteTarget, setDeleteTarget] = useState(null);
+
+  const submit = (preset) => {
+    if (!preset.name?.trim()) return;
+    let next;
+    if (preset.id) {
+      next = presets.map((p) => (p.id === preset.id ? { ...p, ...preset } : p));
+    } else {
+      next = [...presets, { ...preset, id: newId() }];
+    }
+    onChange(next);
+    setEditing(null);
+  };
+
+  const remove = (id) => {
+    onChange(presets.filter((p) => p.id !== id));
+    setDeleteTarget(null);
+  };
+
+  return (
+    <Card>
+      <div className="flex items-center justify-between mb-1 flex-wrap gap-2">
+        <div>
+          <h2 className="font-semibold">Package presets</h2>
+          <p className="text-xs text-stone-500 mt-0.5">Saved box dimensions you ship with most often. Pickable from a dropdown on every new order.</p>
+        </div>
+        <button
+          onClick={() => setEditing({ name: "", length: "", width: "", height: "" })}
+          className="px-3 py-1.5 bg-stone-900 text-white text-sm rounded hover:bg-stone-800 flex items-center gap-1.5"
+        >
+          <Plus className="w-3.5 h-3.5" /> Add preset
+        </button>
+      </div>
+
+      {presets.length === 0 ? (
+        <Empty msg="No package presets yet. Add one to skip typing dimensions on each new order." />
+      ) : (
+        <div className="border border-stone-200 rounded divide-y divide-stone-100 mt-3">
+          {presets.map((p) => (
+            <div key={p.id} className="px-3 py-2 flex items-center gap-3">
+              <div className="flex-1 min-w-0">
+                <div className="font-medium text-sm">{p.name}</div>
+                <div className="text-xs text-stone-500 mt-0.5 tabular-nums">
+                  {p.length}″ L × {p.width}″ W × {p.height}″ H
+                </div>
+              </div>
+              <IconButton onClick={() => setEditing(p)} icon={Pencil} title="Edit" />
+              <IconButton onClick={() => setDeleteTarget(p)} icon={Trash2} title="Remove" danger />
+            </div>
+          ))}
+        </div>
+      )}
+
+      {editing && (
+        <Modal onClose={() => setEditing(null)} title={editing.id ? "Edit preset" : "Add preset"}>
+          <PackagePresetForm initial={editing} onCancel={() => setEditing(null)} onSave={submit} />
+        </Modal>
+      )}
+
+      {deleteTarget && (
+        <ConfirmDeleteModal
+          entityType="Preset"
+          entityName={deleteTarget.name}
+          details={
+            <div><span className="text-stone-500">Dimensions:</span> {deleteTarget.length}″ × {deleteTarget.width}″ × {deleteTarget.height}″</div>
+          }
+          onClose={() => setDeleteTarget(null)}
+          onConfirm={async () => remove(deleteTarget.id)}
+        />
+      )}
+    </Card>
+  );
+}
+
+function PackagePresetForm({ initial, onSave, onCancel }) {
+  const [p, setP] = useState({ name: "", length: "", width: "", height: "", ...initial });
+  const set = (patch) => setP({ ...p, ...patch });
+  const valid = p.name?.trim() && Number(p.length) > 0 && Number(p.width) > 0 && Number(p.height) > 0;
+
+  return (
+    <div className="space-y-3">
+      <Field label="Name *">
+        <input
+          value={p.name}
+          onChange={(e) => set({ name: e.target.value })}
+          className={inputCls}
+          placeholder="e.g. Small box, Medium box, Cold-pack mailer"
+          autoFocus
+        />
+      </Field>
+      <div className="grid grid-cols-3 gap-3">
+        <Field label="Length (in) *">
+          <input type="number" step="0.1" value={p.length} onChange={(e) => set({ length: e.target.value })} className={inputCls} />
+        </Field>
+        <Field label="Width (in) *">
+          <input type="number" step="0.1" value={p.width} onChange={(e) => set({ width: e.target.value })} className={inputCls} />
+        </Field>
+        <Field label="Height (in) *">
+          <input type="number" step="0.1" value={p.height} onChange={(e) => set({ height: e.target.value })} className={inputCls} />
+        </Field>
+      </div>
+      <div className="flex justify-end gap-2 pt-2 border-t border-stone-200">
+        <button onClick={onCancel} className="px-3 py-1.5 text-sm rounded border border-stone-300 hover:bg-stone-50">Cancel</button>
+        <button
+          onClick={() => onSave({
+            ...p,
+            length: Number(p.length) || 0,
+            width: Number(p.width) || 0,
+            height: Number(p.height) || 0,
+          })}
+          disabled={!valid}
+          className="px-3 py-1.5 text-sm rounded bg-stone-900 text-white hover:bg-stone-800 disabled:opacity-50"
+        >
+          Save
+        </button>
+      </div>
+    </div>
+  );
+}
+
+
+/* =========================================================================
+   Tracking email templates (Settings card) — multi-template version
+   ========================================================================= */
+
+function EmailTemplatesCard({ company, onChange }) {
+  const templates = company.emailTemplates || [];
+  const [editingId, setEditingId] = useState(null); // template id being edited; "new" for a new one
+  const [showPreviewId, setShowPreviewId] = useState(null);
+
+  const editingTemplate = editingId === "new"
+    ? { id: "", name: "", subject: "", body: "" }
+    : templates.find((t) => t.id === editingId);
+
+  const saveTemplate = (rec) => {
+    if (!rec.name?.trim()) return;
+    let next;
+    if (editingId === "new" || !rec.id) {
+      next = [...templates, { ...rec, id: rec.id || newId() }];
+    } else {
+      next = templates.map((t) => (t.id === rec.id ? { ...t, ...rec } : t));
+    }
+    onChange({ emailTemplates: next });
+    setEditingId(null);
+  };
+
+  const deleteTemplate = (id) => {
+    onChange({ emailTemplates: templates.filter((t) => t.id !== id) });
+  };
+
+  const resetToDefaults = () => {
+    if (!confirm("Reset all email templates to the default set? Your custom templates will be lost.")) return;
+    onChange({ emailTemplates: DEFAULT_EMAIL_TEMPLATES });
+  };
+
+  return (
+    <Card>
+      <div className="flex items-center justify-between mb-1 flex-wrap gap-2">
+        <h2 className="font-semibold">Tracking email templates</h2>
+        <div className="flex gap-2">
+          <button
+            onClick={resetToDefaults}
+            className="text-xs text-stone-500 hover:text-stone-900 px-2 py-1.5 rounded hover:bg-stone-50"
+          >
+            Reset to defaults
+          </button>
+          <button
+            onClick={() => setEditingId("new")}
+            className="px-3 py-1.5 bg-stone-900 text-white text-sm rounded hover:bg-stone-800 flex items-center gap-1.5"
+          >
+            <Plus className="w-3.5 h-3.5" /> Add template
+          </button>
+        </div>
+      </div>
+      <p className="text-xs text-stone-500 mb-4">
+        Used by the <Mail className="inline w-3 h-3 -mt-0.5" /> button on shipped orders. When you click it, you'll pick a template from a list. Use placeholders like <code className="bg-stone-100 px-1 rounded">{"{tracking}"}</code> — they're replaced with real values automatically.
+      </p>
+
+      {templates.length === 0 ? (
+        <Empty msg="No templates yet. Click Add template, or Reset to defaults to get the starter set." />
+      ) : (
+        <div className="border border-stone-200 rounded divide-y divide-stone-100">
+          {templates.map((t) => (
+            <div key={t.id} className="p-3">
+              <div className="flex items-start gap-3">
+                <div className="flex-1 min-w-0">
+                  <div className="font-medium text-sm">{t.name}</div>
+                  <div className="text-xs text-stone-500 mt-0.5 truncate">{t.subject}</div>
+                </div>
+                <button
+                  onClick={() => setShowPreviewId(showPreviewId === t.id ? null : t.id)}
+                  className="text-xs text-stone-600 hover:text-stone-900 px-2 py-1 rounded hover:bg-stone-100"
+                >
+                  {showPreviewId === t.id ? "Hide" : "Preview"}
+                </button>
+                <IconButton onClick={() => setEditingId(t.id)} icon={Pencil} title="Edit" />
+                <IconButton
+                  onClick={() => {
+                    if (confirm(`Delete template "${t.name}"?`)) deleteTemplate(t.id);
+                  }}
+                  icon={Trash2}
+                  title="Delete"
+                  danger
+                />
+              </div>
+              {showPreviewId === t.id && (
+                <div className="mt-3 bg-stone-50 border border-stone-200 rounded p-3">
+                  <div className="text-xs text-stone-500 mb-1">Preview with sample data:</div>
+                  <div className="text-sm font-medium mb-2">
+                    {fillTrackingTemplate(t.subject || "", { order: SAMPLE_ORDER, company })}
+                  </div>
+                  <pre className="text-xs whitespace-pre-wrap text-stone-700 font-sans leading-relaxed">
+                    {fillTrackingTemplate(t.body || "", { order: SAMPLE_ORDER, company })}
+                  </pre>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {editingId !== null && editingTemplate && (
+        <Modal
+          onClose={() => setEditingId(null)}
+          title={editingId === "new" ? "Add email template" : "Edit email template"}
+        >
+          <EmailTemplateForm
+            initial={editingTemplate}
+            company={company}
+            onCancel={() => setEditingId(null)}
+            onSave={saveTemplate}
+          />
+        </Modal>
+      )}
+    </Card>
+  );
+}
+
+const SAMPLE_ORDER = {
+  invoiceNumber: "REF-04-30-26-007",
+  poNumber: "PO-12345",
+  date: today(),
+  tracking: "794912345678",
+  shipService: "FEDEX_GROUND",
+  total: 1337.75,
+  customerSnapshot: {
+    name: "CRE8 Pharmacy",
+    contactName: "Esan Forde",
+    email: "esan@cre8pharmacy.com",
+  },
+  lineItems: [
+    { description: "GHK-Cu, 1x5g bottle", quantity: 5, unit: "g" },
+    { description: "Dihexa, 5x10g bottle", quantity: 50, unit: "g" },
+  ],
+};
+
+function EmailTemplateForm({ initial, company, onCancel, onSave }) {
+  const [t, setT] = useState({
+    id: initial.id || "",
+    name: initial.name || "",
+    subject: initial.subject || "",
+    body: initial.body || "",
+  });
+  const [showPreview, setShowPreview] = useState(false);
+  const set = (patch) => setT({ ...t, ...patch });
+
+  const placeholders = [
+    { token: "{contact}", desc: "Contact name (falls back to company name)" },
+    { token: "{customer}", desc: "Customer's company name" },
+    { token: "{invoice}", desc: "Invoice number" },
+    { token: "{tracking}", desc: "FedEx tracking number" },
+    { token: "{service}", desc: "Shipping service" },
+    { token: "{date}", desc: "Order date, formatted" },
+    { token: "{total}", desc: "Order total in USD" },
+    { token: "{po}", desc: "Customer PO number (or empty)" },
+    { token: "{poLine}", desc: "“Customer PO: ___” line, blank if no PO" },
+    { token: "{items}", desc: "Bullet list of line items" },
+    { token: "{itemsLine}", desc: "“Contents:” block, blank if empty" },
+    { token: "{company}", desc: "Your company name" },
+    { token: "{signatory}", desc: "Your signatory name" },
+  ];
+
+  const previewSubject = fillTrackingTemplate(t.subject, { order: SAMPLE_ORDER, company });
+  const previewBody = fillTrackingTemplate(t.body, { order: SAMPLE_ORDER, company });
+
+  return (
+    <div className="space-y-3">
+      <Field label="Template name *">
+        <input
+          value={t.name}
+          onChange={(e) => set({ name: e.target.value })}
+          className={inputCls}
+          placeholder="e.g. Shipped — short"
+          autoFocus
+        />
+      </Field>
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+        <div className="md:col-span-2 space-y-3">
+          <Field label="Subject">
+            <input
+              value={t.subject}
+              onChange={(e) => set({ subject: e.target.value })}
+              className={inputCls}
+            />
+          </Field>
+          <Field label="Body">
+            <textarea
+              value={t.body}
+              onChange={(e) => set({ body: e.target.value })}
+              className="w-full min-h-[260px] px-3 py-2 border border-stone-200 rounded text-sm font-mono bg-white focus:outline-none focus:ring-2 focus:ring-stone-900/10 focus:border-stone-400"
+              spellCheck="false"
+            />
+          </Field>
+        </div>
+        <div>
+          <div className="text-xs text-stone-600 font-medium mb-2">Placeholders</div>
+          <div className="border border-stone-200 rounded p-1 max-h-[300px] overflow-y-auto">
+            {placeholders.map((p) => (
+              <button
+                key={p.token}
+                onClick={() => navigator.clipboard?.writeText(p.token)}
+                title={`Click to copy: ${p.token}`}
+                className="block w-full text-left px-2 py-1.5 hover:bg-stone-50 rounded text-xs group"
+              >
+                <code className="font-mono text-stone-900 group-hover:bg-stone-100 px-1 rounded">{p.token}</code>
+                <div className="text-[11px] text-stone-500 mt-0.5">{p.desc}</div>
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      <div className="flex justify-between items-center pt-3 border-t border-stone-200">
+        <button
+          onClick={() => setShowPreview(!showPreview)}
+          className="text-sm text-stone-600 hover:text-stone-900 px-3 py-1.5 rounded border border-stone-200 hover:bg-stone-50"
+        >
+          {showPreview ? "Hide preview" : "Show preview"}
+        </button>
+        <div className="flex gap-2">
+          <button onClick={onCancel} className="px-3 py-1.5 text-sm rounded border border-stone-300 hover:bg-stone-50">Cancel</button>
+          <button
+            onClick={() => onSave(t)}
+            disabled={!t.name?.trim()}
+            className="px-3 py-1.5 text-sm rounded bg-stone-900 text-white hover:bg-stone-800 disabled:opacity-50"
+          >
+            Save template
+          </button>
+        </div>
+      </div>
+
+      {showPreview && (
+        <div className="bg-stone-50 border border-stone-200 rounded p-3 mt-2">
+          <div className="text-xs uppercase tracking-wider text-stone-500 font-medium mb-2">Preview</div>
+          <div className="text-xs text-stone-500 mb-1">Subject:</div>
+          <div className="text-sm font-medium mb-3">{previewSubject}</div>
+          <div className="text-xs text-stone-500 mb-1">Body:</div>
+          <pre className="text-xs whitespace-pre-wrap text-stone-700 font-sans leading-relaxed">{previewBody}</pre>
+        </div>
+      )}
     </div>
   );
 }
@@ -3727,6 +4446,24 @@ function SettingsView({ company, fedex, counters, customers, products, orders, o
         }}
       />
 
+      <PackagePresetsCard
+        presets={c.packagePresets || []}
+        onChange={(presets) => {
+          const next = { ...c, packagePresets: presets };
+          setC(next);
+          onSaveCompany(next);
+        }}
+      />
+
+      <EmailTemplatesCard
+        company={c}
+        onChange={(patch) => {
+          const next = { ...c, ...patch };
+          setC(next);
+          onSaveCompany(next);
+        }}
+      />
+
       <Card>
         <h2 className="font-semibold mb-4">Company info <span className="text-xs text-stone-500 font-normal">— shows on invoices and packing slips</span></h2>
         <div className="grid grid-cols-2 gap-3">
@@ -4002,7 +4739,7 @@ function InvoiceDoc({ order, company }) {
               <td className="py-2 px-2 font-mono text-[9pt]">{it.casNumber}</td>
               <td className="py-2 px-2">{it.unit}</td>
               <td className="py-2 px-2 text-right tabular-nums">{it.quantity}{(it.unit || "g").toLowerCase().slice(0,1)}</td>
-              <td className="py-2 px-2 text-right">{it.unitPriceDisplay || `$${it.unitPriceNum}/g`}</td>
+              <td className="py-2 px-2 text-right">${Number.isInteger(Number(it.unitPriceNum)) ? Number(it.unitPriceNum) : Number(it.unitPriceNum).toFixed(2)}/{(it.unit || "g").toLowerCase().slice(0,1)}</td>
               <td className="py-2 pl-2 text-right tabular-nums">{Number(it.amount).toFixed(2)}</td>
             </tr>
           ))}
@@ -4069,7 +4806,9 @@ function PartyBlock({ label, customer }) {
 
 function PackingDoc({ order, company }) {
   const c = order.customerSnapshot || {};
-  const totalGrams = order.lineItems.reduce((s, x) => s + (Number(x.quantity) || 0) * (Number(x.packCount) || 1), 0);
+  // `quantity` already represents the total grams across all packs in this line item.
+  // Don't multiply by packCount — that double-counts.
+  const totalGrams = order.lineItems.reduce((s, x) => s + (Number(x.quantity) || 0), 0);
 
   return (
     <div className="p-12 text-[11pt]" style={{ fontFamily: "'Inter Tight', ui-sans-serif, system-ui, sans-serif" }}>
@@ -4107,12 +4846,12 @@ function PackingDoc({ order, company }) {
         <tbody>
           {order.lineItems.map((it) => {
             const unit = (it.unit || "g").toLowerCase().slice(0, 1);
-            const total = (Number(it.quantity) || 0) * (Number(it.packCount) || 1);
+            const total = Number(it.quantity) || 0;
             return (
               <tr key={it.id}>
                 <td className="border border-stone-700 py-2 px-2">{stripPackInfo(it.description)}</td>
                 <td className="border border-stone-700 py-2 px-2 font-mono text-[9pt]">{it.batchNumber}</td>
-                <td className="border border-stone-700 py-2 px-2">{it.packSize || `${it.quantity}${unit}/bottle`}</td>
+                <td className="border border-stone-700 py-2 px-2">{it.packSize || `${unit}`}</td>
                 <td className="border border-stone-700 py-2 px-2">{it.packCount || 1}</td>
                 <td className="border border-stone-700 py-2 px-2">{total}{unit}</td>
               </tr>
@@ -4168,6 +4907,32 @@ function PackingDoc({ order, company }) {
 function stripPackInfo(desc) {
   if (!desc) return "";
   return desc.split(",")[0].trim();
+}
+
+/**
+ * Returns the available pack sizes for a product. Always returns an array
+ * (possibly empty). A product can have one size or many — the array shape
+ * is the same either way.
+ */
+function productPackSizes(product) {
+  if (!product || !Array.isArray(product.packSizes)) return [];
+  return product.packSizes.filter(Boolean);
+}
+
+/**
+ * Build the line item description from product name + pack count + pack size.
+ * "GHK-CU" + 10 packs of "5g Bottle" → "GHK-CU, 10x5g Bottle"
+ * If pack count is 1 or missing, just "GHK-CU, 5g Bottle".
+ * If pack size is missing, just the product name.
+ */
+function buildLineDescription(productName, packCount, packSize) {
+  const name = (productName || "").trim();
+  const size = (packSize || "").trim();
+  const count = Number(packCount) || 0;
+  if (!name) return "";
+  if (!size) return name;
+  if (count > 1) return `${name}, ${count}x${size}`;
+  return `${name}, ${size}`;
 }
 
 /* =========================================================================
